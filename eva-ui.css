@@ -1,0 +1,236 @@
+/* ============================================================
+   EVA UI — Sistema de diseño de Sinergia Ingeniería
+   Hoja de estilos reutilizable. Copia este archivo a un nuevo
+   proyecto y enlázalo:  <link rel="stylesheet" href="eva-ui.css">
+   Fuente: Montserrat (se importa abajo).
+   ============================================================ */
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+
+:root{
+  /* ---- Marca ---- */
+  --vm:#386633;            /* Verde Marca — acción primaria, acentos */
+  --vm-h:#2d5229;          /* Verde Marca hover */
+  --vm-lite:rgba(56,102,51,0.10);
+  --pet:#004D40;           /* Petróleo Profundo — headers, nav, tablas, modales, toasts */
+  --pet-lite:rgba(0,77,64,0.08);
+
+  /* ---- Neutros ---- */
+  --neg:#1A1A1B;           /* Negro Carbono — texto principal */
+  --graf:#3C3F41;          /* Gris Grafito — etiquetas */
+  --ace:#8E9291;           /* Gris Acero — texto secundario */
+  --hie:#F2F4F3;           /* Gris Hielo — fondo de página */
+  --wh:#FFFFFF;            /* Blanco — superficies de tarjeta */
+  --brd:#DDE0DF;           /* Borde hairline */
+
+  /* ---- Estados ---- */
+  --danger:#991B1B; --danger-bg:#FEE2E2; --danger-brd:#FCA5A5;
+  --warn:#B45309;   --warn-bg:#FEF3C7;
+  --azul:#185FA5;   --azul-bg:#E6F1FB;
+  --naranja:#D97706;--naranja-bg:#FFEDD5;
+  --gris-bg:#F1EFE8;
+
+  /* ---- Entregas (fases de proyecto) ---- */
+  --e30:#7FB069;   /* 30% */
+  --e60:#E6C84F;   /* 60% */
+  --e100:#E07A5F;  /* 100% */
+  --eifc:#6FA8DC;  /* IFC */
+  --einter:#9B8BC4;/* intermedia */
+
+  /* ---- Puestos (organigrama) ---- */
+  --c-direccion:#004D40; --c-lider:#386633; --c-ing:#3C6E71;
+  --c-asist:#378ADD; --c-model:#8E9291; --c-inspec:#BA7517; --c-admin:#A14A76;
+  --canvas:#FAF9F6; --linea:#C9CFC9;    /* lienzo del organigrama */
+
+  /* ---- Radios ---- */
+  --r-sm:7px; --r-md:9px; --r-lg:12px; --r-xl:16px;
+
+  /* ---- Sombras ---- */
+  --sh-card:0 2px 8px rgba(0,0,0,.06);
+  --sh-header:0 2px 8px rgba(0,0,0,.18);
+  --sh-modal:0 14px 44px rgba(0,0,0,.32);
+  --sh-avatar:0 2px 6px rgba(0,0,0,.12);
+
+  /* ---- Tipografía ---- */
+  --font:'Montserrat',system-ui,-apple-system,sans-serif;
+}
+
+/* ============================================================
+   Base
+   ============================================================ */
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font);background:var(--hie);color:var(--neg);line-height:1.5}
+
+/* ============================================================
+   Tipografía / rótulos
+   ============================================================ */
+.eyebrow,label,.label{
+  display:block;font-size:10px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.07em;color:var(--graf);margin-bottom:5px;
+}
+.seccion-tit{
+  font-size:12px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;
+  color:var(--pet);display:flex;align-items:center;gap:8px;margin:1.5rem 0 .9rem;
+}
+.hint{font-size:10px;color:var(--ace);margin-top:5px;font-weight:500}
+
+/* ============================================================
+   Botones
+   ============================================================ */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  font-family:var(--font);font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+  padding:12px 18px;border:none;border-radius:var(--r-md);
+  background:var(--vm);color:#fff;cursor:pointer;transition:background .2s,box-shadow .15s;
+}
+.btn:hover{background:var(--vm-h)}
+.btn:disabled{background:var(--ace);cursor:not-allowed}
+.btn--block{width:100%}
+.btn--sm{font-size:10px;padding:7px 12px;letter-spacing:.03em;border-radius:var(--r-sm)}
+.btn--ghost{background:transparent;color:var(--graf);border:1px solid var(--brd)}
+.btn--ghost:hover{background:var(--hie)}
+.btn--danger{background:transparent;color:var(--danger);border:1px solid var(--danger-brd)}
+.btn--danger:hover{background:var(--danger-bg)}
+.btn--warn{background:transparent;color:var(--warn);border:1.5px solid var(--warn)}
+.btn--warn:hover{background:var(--warn-bg)}
+.link-btn{background:transparent;border:none;color:var(--vm);font-family:var(--font);font-size:11px;font-weight:700;cursor:pointer;text-decoration:underline}
+
+/* ============================================================
+   Campos de formulario
+   ============================================================ */
+.field{margin-bottom:1rem}
+input,textarea,.input{
+  width:100%;font-family:var(--font);font-size:13px;color:var(--neg);
+  background:var(--hie);border:1px solid var(--brd);border-radius:8px;
+  padding:10px 13px;outline:none;transition:border-color .15s,box-shadow .15s;
+}
+select{
+  width:100%;font-family:var(--font);font-size:12px;color:var(--neg);
+  background:var(--hie);border:1px solid var(--brd);border-radius:var(--r-sm);
+  padding:9px 11px;outline:none;transition:border-color .15s,box-shadow .15s;
+}
+input:focus,textarea:focus,select:focus,.input:focus{
+  border-color:var(--vm);box-shadow:0 0 0 3px var(--vm-lite);background:var(--wh);
+}
+/* Buscador con ícono */
+.buscador{position:relative}
+.buscador input{padding-left:36px;background:var(--wh)}
+.buscador .bi{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--ace);font-size:15px;pointer-events:none}
+
+/* ============================================================
+   Tarjetas / KPIs
+   ============================================================ */
+.card{background:var(--wh);border:.5px solid var(--brd);border-radius:var(--r-lg);box-shadow:var(--sh-card)}
+.card--pad{padding:1.25rem}
+.kpi{background:var(--wh);border:.5px solid var(--brd);border-radius:10px;padding:.8rem .9rem;position:relative;overflow:hidden}
+.kpi-lbl{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ace);margin-bottom:3px}
+.kpi-val{font-size:22px;font-weight:800;color:var(--vm)}
+.kpi-val--pet{color:var(--pet)} .kpi-val--warn{color:var(--warn)}
+.kpi-val--azul{color:var(--azul)} .kpi-val--graf{color:var(--graf)}
+
+/* ============================================================
+   Encabezado de aplicación (banda inclinada — firma visual)
+   ============================================================ */
+.header{background:var(--pet);color:var(--wh);position:sticky;top:0;z-index:200;box-shadow:var(--sh-header)}
+.header-inner{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:.75rem 1.5rem 1.1rem;
+  clip-path:polygon(0 0,100% 0,100% 85%,0 100%);   /* corte diagonal característico */
+}
+.header-brand{display:flex;align-items:center;gap:10px}
+.header-title{font-size:12px;font-weight:800;letter-spacing:.04em}
+.header-sub{font-size:10px;color:rgba(255,255,255,.55);font-weight:500;margin-top:1px}
+.nav-tabs{display:flex;gap:6px}
+.nav-tab{
+  padding:6px 16px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.06em;
+  text-transform:uppercase;cursor:pointer;border:1.5px solid rgba(255,255,255,.25);
+  color:rgba(255,255,255,.7);background:transparent;transition:all .2s;text-decoration:none;font-family:var(--font);
+}
+.nav-tab:hover{color:#fff;border-color:rgba(255,255,255,.5)}
+.nav-tab.active{background:var(--vm);color:#fff;border-color:var(--vm)}
+
+/* ============================================================
+   Control segmentado (tabs tipo píldora)
+   ============================================================ */
+.tabs{display:flex;gap:6px;background:var(--hie);border-radius:10px;padding:4px}
+.tab{
+  flex:1;padding:9px;text-align:center;font-size:12px;font-weight:700;letter-spacing:.04em;
+  border-radius:var(--r-sm);cursor:pointer;transition:all .15s;color:var(--ace);
+  border:none;background:transparent;font-family:var(--font);
+}
+.tab.active{background:var(--wh);color:var(--pet);box-shadow:0 1px 4px rgba(0,0,0,.06)}
+
+/* ============================================================
+   Modal (superficie propia — sin diálogos nativos)
+   ============================================================ */
+.modal-ov{position:fixed;inset:0;background:rgba(26,26,27,.55);display:none;align-items:center;justify-content:center;z-index:1000;padding:1.5rem}
+.modal-ov.show{display:flex}
+.modal{background:var(--wh);border-radius:14px;width:100%;max-width:420px;overflow:hidden;box-shadow:var(--sh-modal);animation:eva-modal-in .2s ease}
+@keyframes eva-modal-in{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+.modal-head{background:var(--pet);color:#fff;padding:.9rem 1.1rem;display:flex;align-items:center;justify-content:space-between}
+.modal-head-tit{font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
+.modal-x{background:rgba(255,255,255,.15);border:none;color:#fff;width:26px;height:26px;border-radius:7px;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center;font-family:var(--font)}
+.modal-x:hover{background:rgba(255,255,255,.28)}
+.modal-body{padding:1.1rem 1.2rem 1.3rem}
+
+/* ============================================================
+   Toast (aviso inferior derecho)
+   ============================================================ */
+.toast{position:fixed;bottom:1.5rem;right:1.5rem;background:var(--pet);color:#fff;font-size:12px;font-weight:600;padding:12px 20px;border-radius:10px;border-left:4px solid var(--vm);z-index:1000;transform:translateY(80px);opacity:0;transition:all .3s;pointer-events:none}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.err{border-left-color:var(--danger)}
+
+/* ============================================================
+   Mensajes en línea (formularios)
+   ============================================================ */
+.msg{font-size:12px;font-weight:600;padding:10px 13px;border-radius:8px;margin-top:1rem}
+.msg--error{background:var(--danger-bg);color:var(--danger);border-left:3px solid var(--danger)}
+.msg--success{background:var(--vm-lite);color:var(--vm);border-left:3px solid var(--vm)}
+.msg--warn{background:var(--warn-bg);color:var(--warn);border-left:3px solid var(--warn)}
+
+/* ============================================================
+   Tabla (cabecera petróleo + filas hairline)
+   ============================================================ */
+.tabla-wrap{background:var(--wh);border:.5px solid var(--brd);border-radius:var(--r-lg);overflow:hidden}
+.t-head{background:var(--pet);color:#fff}
+.th-cell{padding:.7rem .8rem;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;border-right:.5px solid rgba(255,255,255,.12)}
+.t-row{border-bottom:.5px solid var(--brd);cursor:pointer;transition:background .12s}
+.t-row:last-child{border-bottom:none}
+.t-row:hover{background:var(--hie)}
+.td-cell{padding:.7rem .8rem;font-size:12px;color:var(--neg)}
+
+/* ============================================================
+   Insignias / píldoras de estado
+   ============================================================ */
+.badge{display:inline-block;font-size:9px;font-weight:700;padding:4px 9px;border-radius:14px;letter-spacing:.02em;white-space:nowrap}
+.badge--green{background:var(--vm-lite);color:var(--vm)}
+.badge--pet{background:var(--pet-lite);color:var(--pet)}
+.badge--warn{background:var(--warn-bg);color:var(--warn)}
+.badge--danger{background:var(--danger-bg);color:var(--danger)}
+.badge--azul{background:var(--azul-bg);color:var(--azul)}
+.badge--naranja{background:var(--naranja-bg);color:var(--naranja)}
+
+/* ============================================================
+   Avatares del organigrama (círculo con iniciales)
+   ============================================================ */
+.avatar{width:54px;height:54px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:800;color:#fff;border:3px solid var(--wh);box-shadow:var(--sh-avatar)}
+.avatar--direccion{background:var(--c-direccion)}
+.avatar--lider{background:var(--c-lider)}
+.avatar--ing{background:var(--c-ing)}
+.avatar--asist{background:var(--c-asist)}
+.avatar--model{background:var(--c-model)}
+.avatar--inspec{background:var(--c-inspec)}
+.avatar--admin{background:var(--c-admin)}
+
+/* ============================================================
+   Puntos de entrega (fases) + leyenda
+   ============================================================ */
+.dot{display:inline-block;width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 2px rgba(0,0,0,.2);vertical-align:middle}
+.dot--30{background:var(--e30)} .dot--60{background:var(--e60)} .dot--100{background:var(--e100)}
+.dot--ifc{background:var(--eifc)} .dot--inter{background:var(--einter)}
+
+/* ============================================================
+   Tarjeta de autenticación (hero inclinado — firma visual)
+   ============================================================ */
+.auth-card{background:var(--wh);border-radius:var(--r-xl);box-shadow:0 12px 40px rgba(0,0,0,.10);width:100%;max-width:420px;overflow:hidden}
+.auth-hero{background:var(--pet);color:#fff;padding:2rem 2rem 3rem;clip-path:polygon(0 0,100% 0,100% 82%,0 100%)}
+.auth-body{padding:1.5rem 2rem 2rem;margin-top:-1rem;position:relative}

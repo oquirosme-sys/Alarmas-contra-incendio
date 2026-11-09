@@ -1,0 +1,150 @@
+/* ============================================================
+   Sinergia Acceso · Pantallas de acceso (look Suite)
+   ------------------------------------------------------------
+   Cuarta capa, SOLO para ingreso.html y restablecer.html.
+   Orden de enlace:
+     eva-ui.css → suite-color.css → suite-mac.css → suite-auth.css
+
+   La cuarta capa es excluyente y ahora tiene tres variantes:
+     suite-app.css     → una aplicación (barra, página, pie)
+     suite-portal.css  → el lanzador
+     suite-auth.css    → estas dos pantallas
+
+   Se justifica separarla porque acá no hay barra, ni secciones, ni
+   sesión: nadie ha entrado todavía. Cargar suite-app.css sería
+   traer un armazón entero para no usarlo.
+
+   ------------------------------------------------------------
+   POR QUÉ NO SE REUSA .auth-card DE eva-ui.css
+   ------------------------------------------------------------
+   Aquella tarjeta lleva el hero petróleo con corte diagonal, que
+   es la firma de la era anterior. El Suite reemplazó ese gesto por
+   la tesela, así que reusarla obligaría a pelearle el clip-path y
+   el fondo. Se define en español y aparte: .acceso-*
+
+   Todo lo demás —campos, pestañas, botones, mensajes— es de
+   eva-ui.css sin una sola línea propia. Acá no se estiliza ningún
+   formulario.
+   ============================================================ */
+
+
+/* ============================================================
+   Centrado de la pantalla
+   ------------------------------------------------------------
+   El fondo con los dos lavados de color lo pone suite-mac.css a
+   partir de data-app; acá solo se centra la tarjeta.
+   ============================================================ */
+.acceso-wrap{
+  min-height:100vh;
+  display:flex;align-items:center;justify-content:center;
+  padding:1.5rem;
+}
+
+
+/* ============================================================
+   La tarjeta
+   ------------------------------------------------------------
+   Vidrio y elevación, no borde. Sobre el fondo lavado un hairline
+   se pierde; lo que separa la superficie es la sombra.
+   ============================================================ */
+.acceso-card{
+  width:100%;max-width:400px;
+  border-radius:20px;
+  border:var(--mac-filo);
+  background:rgba(255,255,255,.86);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  backdrop-filter:blur(24px) saturate(180%);
+  box-shadow:0 28px 56px -18px rgba(0,0,0,.22), 0 2px 8px -2px rgba(0,0,0,.06);
+  overflow:hidden;
+}
+
+
+/* ============================================================
+   Encabezado: tesela + identidad
+   ------------------------------------------------------------
+   La tesela grande hace acá el trabajo que hacía la banda
+   diagonal: decir de qué aplicación es esta pantalla antes de que
+   nadie escriba su clave. El color sale de data-app.
+   ============================================================ */
+.acceso-tope{
+  padding:2.2rem 2rem 1.5rem;
+  display:flex;flex-direction:column;align-items:center;text-align:center;
+}
+.acceso-tope .tesela{--tesela:64px;margin-bottom:1rem}
+
+.acceso-nombre{
+  font-size:23px;font-weight:800;letter-spacing:-.025em;
+  color:var(--app);line-height:1.15;
+}
+.acceso-lema{
+  font-size:11.5px;font-weight:500;color:var(--ace);margin-top:.25rem;
+}
+
+
+/* ============================================================
+   Cuerpo
+   ============================================================ */
+.acceso-cuerpo{padding:0 2rem 1.6rem}
+
+/* El control segmentado de eva-ui.css sobre vidrio: su fondo gris
+   sólido se ve como un parche, así que se translucida. Es lo único
+   que se le retoca. */
+.acceso-cuerpo .tabs{
+  background:rgba(0,0,0,.045);
+  margin-bottom:1.5rem;
+}
+.acceso-cuerpo .tab.active{background:var(--wh)}
+
+.acceso-link{
+  text-align:center;margin-top:.9rem;
+}
+
+/* Vuelta atrás desde recuperar contraseña */
+.acceso-volver{
+  display:block;width:100%;text-align:center;margin-top:.9rem;
+  background:transparent;border:none;cursor:pointer;
+  font-family:var(--font);font-size:10px;font-weight:700;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--ace);
+  transition:color .15s;
+}
+.acceso-volver:hover{color:var(--app)}
+
+
+/* ============================================================
+   Pantalla de espera (registro aprobado por un administrador)
+   ------------------------------------------------------------
+   No es un error y no debe leerse como tal: ámbar, no rojo. El
+   registro salió bien; lo que falta es que alguien apruebe.
+   ============================================================ */
+.acceso-espera{text-align:center;padding:.5rem 0 .25rem}
+.acceso-espera .ic{font-size:2.4rem;margin-bottom:.7rem}
+.acceso-espera b{
+  display:block;font-size:14px;font-weight:800;color:var(--graf);
+  margin-bottom:.4rem;letter-spacing:-.01em;
+}
+.acceso-espera p{font-size:12px;color:var(--ace);font-weight:500;line-height:1.55}
+
+
+/* ============================================================
+   Pie
+   ============================================================ */
+.acceso-pie{
+  margin-top:1.5rem;padding-top:1.1rem;
+  border-top:.5px solid var(--brd);
+  text-align:center;
+  font-size:9px;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ace);opacity:.8;
+}
+
+
+/* ============================================================
+   Pantallas angostas
+   ============================================================ */
+@media(max-width:420px){
+  .acceso-tope{padding:1.8rem 1.4rem 1.2rem}
+  .acceso-cuerpo{padding:0 1.4rem 1.3rem}
+}
+
+@media(prefers-reduced-motion:reduce){
+  .acceso-card{transition:none}
+}

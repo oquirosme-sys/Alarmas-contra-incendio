@@ -1,0 +1,2393 @@
+/* Interfaz — Cálculo de baterías para alarma contra incendio.
+ * Estructura de pestañas (reemplaza las hojas del Excel):
+ *   Proyecto            → datos generales, parámetros NFPA 72, niveles, lista de paneles y fuentes
+ *   <TAG de panel>      → una pestaña por panel / transponder (BAT_FACP_xx, BAT_TRP_xx)
+ *   <TAG de fuente>     → una pestaña por fuente auxiliar (CALC_FUENTE_AUX)
+ *   Caída de tensión    → CALC_CAIDA_TENSION
+ *   Memoria de cálculo  → MEMORIA_CALCULO + RESUMEN_PANELES (imprimible)
+ *   Administración      → BD_DISPOSITIVOS, BD_CABLES, BD_BATERIAS (solo administrador; hojas ocultas del Excel) */
+(function () {
+  'use strict';
+
+  var S = {
+    cat: null, cx: null, proy: null, lista: [],
+    tab: 'proyecto', adminSub: 'dispositivos',
+    adminFiltro: { fab: '', q: '' },
+    pintor: null, importModo: 'proyecto',
+    tGuardar: null, tGuardarCat: null
+  };
+
+  var vista = document.getElementById('vista');
+  // «← Suite» lleva al portal (APP_CONFIG.suiteUrl)
+  document.getElementById('volverSuite').href = (window.APP_CONFIG && APP_CONFIG.suiteUrl) || 'index.html';
+  var tabsEl = document.getElementById('tabs');
+
+  /* ======================= utilidades ======================= */
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function fmt(v, d) {
+    if (v === null || v === undefined || v === '' || !isFinite(v)) return '—';
+    d = d === undefined ? 2 : d;
+    return Number(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+  function fmtN(v) { return v === null || v === undefined ? '' : v; }
+  function hoy() { return new Date().toISOString().slice(0, 10); }
+  function porId(lista, id) { for (var i = 0; i < (lista || []).length; i++) if (lista[i].id === id) return lista[i]; return null; }
+  function badge(estado) {
+    if (!estado) return '<span class="badge pend">—</span>';
+    var cls = estado === 'OK' ? 'ok' : (estado.indexOf('ERROR') === 0 || estado === 'REVISAR' ? 'error' : 'warn');
+    return '<span class="badge ' + cls + '">' + esc(estado) + '</span>';
+  }
+  function out(clave, html) {
+    var els = vista.querySelectorAll('[data-out="' + clave + '"]');
+    for (var i = 0; i < els.length; i++) els[i].innerHTML = html;
+  }
+  function toast(msg) {
+    var t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('on');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function () { t.classList.remove('on'); }, 2600);
+  }
+  function descargar(nombre, datos) {
+    var blob = new Blob([JSON.stringify(datos, null, 2)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = nombre.replace(/[\\/:*?"<>|]+/g, '_');
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  }
+
+  /* Diálogo genérico: devuelve los valores del formulario o null si se cancela */
+  function dialogo(op) {
+    var dlg = document.getElementById('dlg');
+    document.getElementById('dlgTitulo').textContent = op.titulo || '';
+    document.getElementById('dlgCuerpo').innerHTML = op.html || '';
+    var ok = document.getElementById('dlgOk');
+    ok.textContent = op.ok || 'Aceptar';
+    ok.style.background = ok.style.borderColor = op.peligro ? 'var(--err)' : '';
+    document.getElementById('dlgCancelar').hidden = op.soloOk === true;
+    dlg.returnValue = '';
+    dlg.showModal();
+    var primero = dlg.querySelector('#dlgCuerpo input, #dlgCuerpo select');
+    if (primero) primero.focus();
+    return new Promise(function (res) {
+      dlg.addEventListener('close', function h() {
+        dlg.removeEventListener('close', h);
+        if (dlg.returnValue !== 'ok') return res(null);
+        var datos = {};
+        dlg.querySelectorAll('#dlgCuerpo [name]').forEach(function (el) { datos[el.name] = el.value; });
+        res(datos);
+      });
+    });
+  }
+  function confirmar(titulo, texto, ok) {
+    return dialogo({ titulo: titulo, html: '<p>' + texto + '</p>', ok: ok || 'Eliminar', peligro: true })
+      .then(function (r) { return r !== null; });
+  }
+
+  /* ======================= modelo ======================= */
+  function buscarDisp(fab, modelo, tag) {
+    var d = (S.cat.dispositivos || []).filter(function (x) {
+      return x.fabricante === fab && (!modelo || x.modelo === modelo) && (!tag || x.tag === tag);
+    })[0];
+    return d ? d.id : '';
+  }
+
+  function nuevoProyecto(nombre) {
+    var fab = (S.cat.fabricantes[0] || {}).id || '';
+    return {
+      id: uid('p'), nombre: nombre || 'Proyecto nuevo', numero: '', cliente: '', ubicacion: '',
+      elaboro: '', reviso: '', empresa: 'Sinergia Ingeniería', fecha: hoy(), revision: '0',
+      fabricante: fab, normativa: 'NFPA 72:2022 · UL 864 · NEC (NFPA 70) Art. 760',
+      params: clonar(Calc.PARAMS_DEF),
+      niveles: [], paneles: [], fuentes: [],
+      caida: { circuitos: [] }
+    };
+  }
+
+  function normalizar(p) {
+    p.params = Object.assign(clonar(Calc.PARAMS_DEF), p.params || {});
+    p.niveles = p.niveles || [];
+    p.paneles = p.paneles || [];
+    p.fuentes = p.fuentes || [];
+    p.caida = p.caida || {};
+    p.caida.circuitos = p.caida.circuitos || [];
+    // Proyectos anteriores: los circuitos se capturaban por categorías de cantidad; ahora la corriente sale de los dispositivos
+    // asignados a cada lazo. Se conserva el resultado pasando lo capturado a «otros (mA)».
+    var cats = p.caida.categorias || [];
+    p.caida.circuitos.forEach(function (c) {
+      if (c.q && c.q.some(function (x) { return Calc.num(x) !== null; })) {
+        var suma = 0;
+        c.q.forEach(function (x, i) { var d = S.cx.disp[cats[i]]; suma += (Calc.num(x) || 0) * (d ? Calc.num(d.iAlarma) || 0 : 0); });
+        c.otros = (Calc.num(c.otros) || 0) + suma;
+      }
+      delete c.q;
+      c.tipo = c.tipo || tipoPorNombre(c.circuito);
+      c.clase = c.clase === 'A' ? 'A' : 'B';
+      c.nivel = c.nivel || '';
+      c.desc = c.desc || '';
+    });
+    delete p.caida.categorias;
+    p.paneles.concat(p.fuentes).forEach(function (e) { e.filas = e.filas || []; e.filas.forEach(function (f) { f.circ = f.circ || ''; f.circ2 = f.circ2 || ''; f.t2 = f.t2 || ''; }); });
+    return p;
+  }
+
+  function nuevaFila(fab, zona, circ) {
+    return { id: uid('r'), fab: fab || S.proy.fabricante, disp: '', zona: zona || '', circ: circ || '', circ2: '', cant: null, iEsp: null, iAlm: null, obs: '' };
+  }
+
+  function tipoPorNombre(nombre) {
+    var m = String(nombre || '').toUpperCase().replace(/\s+/g, '').match(/^(NAC\+VOCEO|IDNAC|SLC|NAC|VOCEO|IDC|TEL|24V)/);
+    return m ? (m[1] === '24V' ? '24VDC' : m[1]) : 'NAC';
+  }
+
+  function tagLibre(base) {
+    var usados = S.proy.paneles.concat(S.proy.fuentes).map(function (e) { return e.tag; });
+    if (usados.indexOf(base) < 0) return base;
+    for (var i = 2; i < 999; i++) if (usados.indexOf(base + '-' + i) < 0) return base + '-' + i;
+    return base;
+  }
+
+  function nivelCorto(nivel) {
+    var n = String(nivel || '').toUpperCase().trim();
+    var m = n.match(/^(S[OÓ]TANO|NIVEL|PISO|N|S)\s*-?\s*(\d+)/);
+    if (m) return (m[1].charAt(0) === 'S' ? 'S' : 'N') + m[2];
+    return n.replace(/\s+/g, '').slice(0, 6);
+  }
+
+  function nuevoPanel(tipo, nivel) {
+    var P = S.proy;
+    var nFacp = P.paneles.filter(function (x) { return x.tipo === 'FACP'; }).length;
+    var tag = tipo === 'FACP' ? tagLibre('FACP-' + ('0' + (nFacp + 1)).slice(-2))
+      : tagLibre('TRP-' + (nivel ? nivelCorto(nivel) : ('0' + (P.paneles.length + 1)).slice(-2)));
+    var f = nuevaFila(P.fabricante, nivel);
+    f.disp = buscarDisp(P.fabricante, null, tipo);
+    f.cant = f.disp ? 1 : null;
+    f.obs = '(consumo propio del equipo)';
+    return { id: uid('pn'), tag: tag, tipo: tipo, nivel: nivel || '', descripcion: '', tEspera: null, tAlarma: null, fs: null, filas: [f] };
+  }
+
+  function nuevaFuente(nivel) {
+    var P = S.proy;
+    return {
+      id: uid('fu'), tag: tagLibre('RPS-' + ('0' + (P.fuentes.length + 1)).slice(-2)), nivel: nivel || '',
+      panelId: (P.paneles[0] || {}).id || '', descripcion: '', iMax: 8, iPropia: 0.145,
+      tEspera: null, tAlarma: null, fs: null, filas: []
+    };
+  }
+
+  /* Amplificador de voceo: se guarda en la misma lista que las fuentes (tipo 'AMP') y tiene su propia sección y pestaña */
+  function nuevoAmplificador(nivel) {
+    var P = S.proy, n = P.fuentes.filter(function (x) { return x.tipo === 'AMP'; }).length + 1;
+    return {
+      id: uid('fu'), tipo: 'AMP', tag: tagLibre('AMP-' + ('0' + n).slice(-2)), nivel: nivel || '',
+      panelId: (P.paneles[0] || {}).id || '', descripcion: '', iMax: null, iPropia: null,
+      tEspera: null, tAlarma: null, fs: null, filas: []
+    };
+  }
+  function esAmp(e) { return !!e && e.tipo === 'AMP'; }
+
+  /* Proyecto en blanco con un solo nivel y su panel principal (FACP) */
+  function proyectoConPrimerNivel(nombre, nivel) {
+    var p = nuevoProyecto(nombre), prev = S.proy;
+    S.proy = p;
+    p.niveles.push(nivel);
+    p.paneles.push(nuevoPanel('FACP', nivel));
+    S.proy = prev;
+    return p;
+  }
+
+  /* Lazo o salida de un panel: tipo (SLC, NAC, IDNAC, 24 VDC, voceo, IDC), nivel, cable (según la simbología: 5220UL; voceo 5220FL) y longitud */
+  function nuevoCircuito(equipoId, tipo) {
+    tipo = tipo || 'NAC';
+    var eq = equipoId || (S.proy.paneles[0] || {}).id || '';
+    var n = S.proy.caida.circuitos.filter(function (c) { return c.fuente === eq && c.tipo === tipo; }).length + 1;
+    return { id: uid('c'), fuente: eq, tipo: tipo, clase: 'B', circuito: (tipo === '24VDC' ? '24 VDC' : tipo) + ' ' + n, nivel: '', desc: '', otros: null, cable: buscarCable(tipo === 'VOCEO' || tipo === 'TEL' ? '5220FL' : '5220UL'), long: null };
+  }
+  /* «Alimentado por»: fuente auxiliar o amplificador que carga con la corriente de los dispositivos del lazo */
+  var TIPOS_ALIM = /^(VOCEO|NAC\+VOCEO|SLC\+24V|NAC|IDNAC|24VDC)$/;
+  function optsAlim(c, sel) {
+    // se pueden elegir amplificadores y fuentes auxiliares para cualquier lazo; primero los que corresponden al tipo
+    var t = c.tipo, fu = S.proy.fuentes, amps = fu.filter(function (f) { return f.tipo === 'AMP'; }), rps = fu.filter(function (f) { return f.tipo !== 'AMP'; });
+    var vacio = t === 'VOCEO' ? '— sin amplificador —' : '— el propio equipo —', ok = false;
+    function grupo(lista, nombre) {
+      if (!lista.length) return '';
+      return '<optgroup label="' + nombre + '">' + lista.map(function (f) {
+        if (f.id === sel) ok = true;
+        return '<option value="' + esc(f.id) + '"' + (f.id === sel ? ' selected' : '') + '>' + esc(f.tag + (f.nivel ? ' · ' + f.nivel : '')) + '</option>';
+      }).join('') + '</optgroup>';
+    }
+    var h = '<option value="">' + vacio + '</option>';
+    h += /VOCEO/.test(t) ? grupo(amps, 'Amplificadores') + grupo(rps, 'Fuentes auxiliares') : grupo(rps, 'Fuentes auxiliares') + grupo(amps, 'Amplificadores');
+    if (sel && !ok) h += '<option value="' + esc(sel) + '" selected>(equipo eliminado)</option>';
+    return h;
+  }
+  function celdaClase(c) {
+    if (c.tipo === '24VDC') return '<td class="muted" style="text-align:center">—</td>';
+    return '<td><select class="in w-xs" data-o="circ" data-id="' + esc(c.id) + '" data-k="clase" title="Clase A: el circuito regresa al panel por un segundo camino. Clase B: un solo camino">' +
+      '<option value="B"' + (c.clase === 'A' ? '' : ' selected') + '>B</option><option value="A"' + (c.clase === 'A' ? ' selected' : '') + '>A</option></select></td>';
+  }
+  function celdaAlim(c) {
+    if (!TIPOS_ALIM.test(c.tipo)) return '<td class="muted" style="text-align:center">—</td>';
+    return '<td><select class="in w-md" data-o="circ" data-id="' + esc(c.id) + '" data-k="alim" title="Fuente auxiliar o amplificador que carga con los dispositivos de este lazo">' + optsAlim(c, c.alim) + '</select></td>';
+  }
+  function etiquetaTipo(t) { return t === '24VDC' ? '24 VDC' : (t === 'VOCEO' ? 'Voceo' : (t === 'NAC+VOCEO' ? 'NAC + Voceo' : (t === 'SLC+24V' ? 'SLC + 24 V' : (t === 'TEL' ? 'Teléfono' : t)))); }
+  function optsTiposLazo(sel) { return opts(Calc.TIPOS_LAZO.map(function (t) { return { v: t, l: etiquetaTipo(t) }; }), sel); }
+  function lazosDe(eqId) { return S.proy.caida.circuitos.filter(function (c) { return c.fuente === eqId; }); }
+  function optsLazos(eq, sel, tipo) {
+    var h = '<option value="">— sin lazo —</option>' + lazosDe(eq.id).filter(function (c) { return !tipo || c.tipo === tipo; }).map(function (c) {
+      return '<option value="' + esc(c.id) + '"' + (c.id === sel ? ' selected' : '') + '>' + esc(c.circuito) + (c.nivel ? ' · ' + esc(c.nivel) : '') + '</option>';
+    }).join('');
+    if (sel && !porId(S.proy.caida.circuitos, sel)) h += '<option value="' + esc(sel) + '" selected>(lazo eliminado)</option>';
+    return h + '<option value="__nuevo__">＋ Nuevo lazo…</option>';
+  }
+  /* Lazos para una fila de la vista de nivel: los del equipo de la fila y, aparte, los lazos de OTROS equipos que están en este nivel
+   * (p. ej. el lazo de teléfonos del panel principal). Primero los del tipo que corresponde al dispositivo. */
+  function optsLazosNivel(eq, sel, nivel, d) {
+    var t = d ? Calc.tipoLazoDe(d) : null, vistos = {};
+    function ord(l) { return l.slice().sort(function (a, b) { return t ? ((b.tipo === t) - (a.tipo === t)) : 0; }); }
+    function op(c) {
+      vistos[c.id] = 1;
+      return '<option value="' + esc(c.id) + '"' + (c.id === sel ? ' selected' : '') + '>' + esc(c.circuito) + (c.nivel ? ' · ' + esc(c.nivel) : '') + '</option>';
+    }
+    var h = '<option value="">— sin lazo —</option>' + ord(lazosDe(eq.id)).map(op).join('');
+    // lazos de los demás equipos (de cualquier nivel: un lazo del panel principal puede llegar a todos los niveles); el panel principal primero
+    S.proy.paneles.concat(S.proy.fuentes).forEach(function (o) {
+      if (o.id === eq.id) return;
+      var ls = lazosDe(o.id);
+      if (ls.length) h += '<optgroup label="Lazos de ' + esc(o.tag + (o.nivel ? ' · ' + o.nivel : '')) + '">' + ord(ls).map(op).join('') + '</optgroup>';
+    });
+    var actual = sel && porId(S.proy.caida.circuitos, sel);
+    if (actual && !vistos[actual.id]) h += '<option value="' + esc(actual.id) + '" selected>' + esc(actual.circuito + ' · ' + nombreEquipo(actual.fuente)) + '</option>';
+    else if (sel && !actual) h += '<option value="' + esc(sel) + '" selected>(lazo eliminado)</option>';
+    return h + '<option value="__nuevo__">＋ Nuevo lazo…</option>';
+  }
+  /* Segundo lazo de un dispositivo con doble conexión: lazos del tipo pedido del equipo de la fila y de los demás equipos (agrupados) */
+  function optsLazosTipo(eq, sel, tipo) {
+    var vistos = {};
+    function op(c) { vistos[c.id] = 1; return '<option value="' + esc(c.id) + '"' + (c.id === sel ? ' selected' : '') + '>' + esc(c.circuito) + (c.nivel ? ' · ' + esc(c.nivel) : '') + '</option>'; }
+    var h = '<option value="">— ' + esc(etiquetaTipo(tipo)) + ' —</option>' + lazosDe(eq.id).filter(function (c) { return c.tipo === tipo; }).map(op).join('');
+    S.proy.paneles.concat(S.proy.fuentes).forEach(function (o) {
+      if (o.id === eq.id) return;
+      var ls = lazosDe(o.id).filter(function (c) { return c.tipo === tipo; });
+      if (ls.length) h += '<optgroup label="Lazos de ' + esc(o.tag + (o.nivel ? ' · ' + o.nivel : '')) + '">' + ls.map(op).join('') + '</optgroup>';
+    });
+    var actual = sel && porId(S.proy.caida.circuitos, sel);
+    if (actual && !vistos[actual.id]) h += '<option value="' + esc(actual.id) + '" selected>' + esc(actual.circuito + ' · ' + nombreEquipo(actual.fuente)) + '</option>';
+    else if (sel && !actual) h += '<option value="' + esc(sel) + '" selected>(lazo eliminado)</option>';
+    return h + '<option value="__nuevo__">＋ Nuevo lazo…</option>';
+  }
+  /* En la vista de nivel: si se elige un lazo de otro equipo, la fila pasa a ese equipo (el lazo define de dónde sale el dispositivo) */
+  function reasignarPorLazo(el) {
+    var eq = equipo(el.dataset.eq), f = eq && porId(eq.filas, el.dataset.id), k = el.dataset.k;
+    var c = f && porId(S.proy.caida.circuitos, f[k]);
+    if (!c || c.fuente === eq.id) return;
+    var dest = porId(S.proy.paneles, c.fuente) || porId(S.proy.fuentes, c.fuente);
+    if (!dest) return;
+    eq.filas = eq.filas.filter(function (x) { return x !== f; });
+    dest.filas.push(f);
+    proyectoCambiado(); renderVista();
+    toast('Dispositivo conectado a ' + dest.tag + ' (lazo ' + c.circuito + ')');
+  }
+  function quitarLazos(eqId) {
+    var ids = lazosDe(eqId).map(function (c) { return c.id; });
+    S.proy.caida.circuitos = S.proy.caida.circuitos.filter(function (c) { return ids.indexOf(c.id) < 0; });
+    S.proy.paneles.concat(S.proy.fuentes).forEach(function (e) { e.filas.forEach(function (f) { if (ids.indexOf(f.circ) >= 0) f.circ = ''; if (ids.indexOf(f.circ2) >= 0) f.circ2 = ''; }); });
+  }
+  function buscarCable(modelo) {
+    var c = (S.cat.cables || []).filter(function (x) { return x.modelo === modelo; })[0];
+    return c ? c.id : '';
+  }
+
+  /* Proyecto de ejemplo con los mismos datos del Excel original (sirve para verificar resultados) */
+  function proyectoEjemplo() {
+    var p = nuevoProyecto('Proyecto de ejemplo (Excel)');
+    var prev = S.proy;
+    S.proy = p;
+    p.fabricante = 'simplex';
+    p.niveles = ['SÓTANO 2', 'NIVEL 1', 'NIVEL 3', 'NIVEL 6', 'NIVEL 9'];
+    var facp = nuevoPanel('FACP', 'NIVEL 1');
+    facp.descripcion = 'Panel principal';
+    facp.filas[0].disp = buscarDisp('simplex', '4010ES', 'FACP');
+    facp.filas[0].cant = 14;
+    p.paneles.push(facp);
+    ['SÓTANO 2', 'NIVEL 3', 'NIVEL 6', 'NIVEL 9'].forEach(function (n) {
+      var t = nuevoPanel('TRP', n);
+      t.filas[0].disp = buscarDisp('simplex', '4100-9600', 'TRP');
+      p.paneles.push(t);
+    });
+    var rps = nuevaFuente('NIVEL 1');
+    rps.panelId = facp.id;
+    var fr = nuevaFila('simplex', 'HABITACIONES N2');
+    fr.disp = buscarDisp('simplex', '4906-9151', 'ST-P 110cd');
+    fr.cant = 20;
+    fr.obs = '(fila de ejemplo — reemplazar)';
+    rps.filas.push(fr);
+    p.fuentes.push(rps);
+    var c1 = nuevoCircuito(facp.id, 'NAC');
+    c1.nivel = 'NIVEL 1'; c1.desc = 'Parqueo — ejemplo'; c1.otros = 1042; c1.long = 150;     // 5 × 74 mA + 8 × 84 mA (Excel original)
+    p.caida.circuitos.push(c1);
+    var c2 = nuevoCircuito(facp.id, 'SLC');
+    c2.nivel = 'NIVEL 1'; c2.desc = 'Lazo detección N1-N3 — ejemplo'; c2.otros = 1500; c2.long = 350;
+    p.caida.circuitos.push(c2);
+    S.proy = prev;
+    return p;
+  }
+
+  function equipo(ref) {
+    var t = ref.split(':');
+    return porId(t[0] === 'p' ? S.proy.paneles : S.proy.fuentes, t[1]);
+  }
+  function nombreEquipo(id) {
+    var e = porId(S.proy.paneles, id) || porId(S.proy.fuentes, id);
+    return e ? e.tag : (id ? '(eliminado)' : '');
+  }
+
+  /* ======================= guardado ======================= */
+  var REMOTO = true;                    // los datos viven siempre en la base de datos
+  var ESPERA_GUARDADO = 900;
+
+  function msgError(e) { return (e && (e.message || e.error_description)) || String(e); }
+
+  function estadoGuardado(estado) {
+    var el = document.getElementById('estadoGuardado');
+    el.textContent = estado === 'error' ? '● Sin guardar' : (estado ? '● Guardando…' : '● Guardado');
+    el.title = 'Los datos se guardan en la base de datos';
+    el.classList.toggle('dirty', !!estado);
+  }
+  function proyectoCambiado() {
+    estadoGuardado(true);
+    clearTimeout(S.tGuardar);
+    S.tGuardar = setTimeout(guardarYa, ESPERA_GUARDADO);
+  }
+  function guardarYa() {
+    clearTimeout(S.tGuardar);
+    S.tGuardar = null;
+    if (S.enConflicto) return Promise.resolve();
+    return Store.saveProyecto(S.proy).then(function (res) {
+      if (res === 'conflicto') return resolverConflicto();
+      if (!res) { estadoGuardado('error'); toast('⚠ No se pudo guardar'); return; }
+      estadoGuardado(false);
+    }).catch(function (e) {
+      estadoGuardado('error');
+      toast('⚠ Error al guardar: ' + msgError(e));
+    });
+  }
+
+  /* Otro usuario guardó el mismo proyecto mientras se editaba: se carga su versión para no pisarla */
+  function resolverConflicto() {
+    S.enConflicto = true;
+    estadoGuardado('error');
+    return dialogo({
+      titulo: 'El proyecto cambió',
+      html: '<p style="margin:0">Otro usuario guardó cambios en este proyecto mientras se editaba. Se cargará la versión actual; los últimos cambios sin guardar de esta pantalla se perderán.</p>',
+      ok: 'Cargar la versión actual', soloOk: true
+    }).then(function () {
+      S.enConflicto = false;
+      return Store.getProyecto();
+    }).then(function (p) {
+      return abrirProyecto(p || proyectoConPrimerNivel(Store.proyecto().nombre, 'NIVEL 1'), S.tab, false);
+    }).then(function () { estadoGuardado(false); toast('Versión actual cargada'); });
+  }
+
+  function catalogoCambiado(tabla) {
+    S.cx = Calc.preparar(S.cat);
+    S.tablasSucias = S.tablasSucias || {};
+    if (tabla) S.tablasSucias[tabla] = 1; else S.tablasSucias.todas = 1;
+    estadoGuardado(true);
+    clearTimeout(S.tGuardarCat);
+    S.tGuardarCat = setTimeout(guardarCatalogo, ESPERA_GUARDADO);
+  }
+  function guardarCatalogo() {
+    clearTimeout(S.tGuardarCat);
+    var sucias = S.tablasSucias || {};
+    S.tablasSucias = {};
+    var tablas = sucias.todas ? null : Object.keys(sucias);
+    return Store.saveCatalogo(S.cat, tablas).then(function () { estadoGuardado(false); }).catch(function (e) {
+      estadoGuardado('error');
+      toast('⚠ No se pudo guardar el catálogo: ' + msgError(e));
+    });
+  }
+
+  /* ======================= barra superior ======================= */
+  // El proyecto lo define la Suite y la administración es una pestaña visible solo con el rol Administrador.
+  function renderSelector() { }
+  function renderAdminBtn() { }
+
+  /* ======================= pestañas ======================= */
+  function estadoEquipo(r, eq) {
+    var conDatos = (eq.filas || []).some(function (f) { return f.disp || Calc.num(f.cant) !== null; });
+    if (!conDatos) return 'pend';
+    return r.estado === 'OK' ? 'ok' : 'error';
+  }
+
+  function renderTabs() {
+    var P = S.proy, h = [];
+    function tab(id, label, sub, dot, extra) {
+      h.push('<button class="seccion' + (S.tab === id ? ' activa' : '') + (extra || '') + '" role="tab" data-tab="' + esc(id) + '">' +
+        (dot ? '<span class="dot ' + dot + '"></span>' : '') + esc(label) +
+        (sub ? ' <span class="sec-sub">' + esc(sub) + '</span>' : '') + '</button>');
+    }
+    tab('proyecto', 'Proyecto');
+    h.push('<span class="seccion-sep"></span>');
+    var yaTab = {};
+    P.niveles.forEach(function (n) {
+      var ps = P.paneles.filter(function (p) { return p.nivel === n; });
+      if (ps.length) ps.forEach(function (p) { yaTab[p.id] = 1; tab('p:' + p.id, p.tag || '(sin TAG)', p.nivel, estadoEquipo(Calc.panel(S.cx, p, P), p)); });
+      else tab('n:' + n, n, 'sin panel', dispositivosEnNivel(n).length ? 'ok' : 'pend');      // el nivel existe aunque solo lleve sensores o dispositivos
+    });
+    P.paneles.filter(function (p) { return !yaTab[p.id]; }).forEach(function (p) { tab('p:' + p.id, p.tag || '(sin TAG)', p.nivel, estadoEquipo(Calc.panel(S.cx, p, P), p)); });
+    h.push('<button class="seccion mas" data-act="nivel-nuevo" title="Agregar un nivel con su panel/transponder">+ Nivel</button>');
+    if (P.fuentes.length) h.push('<span class="seccion-sep"></span>');
+    P.fuentes.forEach(function (f) { tab('f:' + f.id, f.tag || '(sin TAG)', esAmp(f) ? 'amplificador' : 'fuente aux.', estadoEquipo(Calc.fuente(S.cx, f, P), f)); });
+    h.push('<span class="seccion-sep"></span>');
+    var cd = Calc.caida(S.cx, P);
+    tab('caida', 'Caída de tensión', '', P.caida.circuitos.length ? (cd.errores ? 'error' : 'ok') : 'pend');
+    tab('memoria', 'Memoria de cálculo');
+    tab('laminas', 'Diagrama unifilar');
+    if (Auth.esAdmin()) tab('admin', 'Administración', '', '', ' admin');
+    tabsEl.innerHTML = h.join('');
+  }
+
+  function irA(tab) {
+    S.tab = tab;
+    render();
+    window.scrollTo(0, 0);
+  }
+
+  function render() {
+    renderTabs();
+    renderVista();
+  }
+
+  function renderVista() {
+    var y = window.scrollY;
+    S.pintor = null;
+    var t = S.tab;
+    if (t === 'admin' && !Auth.esAdmin()) t = S.tab = 'proyecto';
+    if ((t.indexOf('p:') === 0 || t.indexOf('f:') === 0) && !equipo(t)) t = S.tab = 'proyecto';
+    if (t.indexOf('n:') === 0 && S.proy.niveles.indexOf(t.slice(2)) < 0) t = S.tab = 'proyecto';
+    if (t === 'proyecto') vistaProyecto();
+    else if (t.indexOf('p:') === 0 || t.indexOf('f:') === 0) vistaEquipo(t);
+    else if (t.indexOf('n:') === 0 && S.proy.niveles.indexOf(t.slice(2)) >= 0) vistaNivel(t.slice(2));
+    else if (t === 'caida') vistaCaida();
+    else if (t === 'memoria') vistaMemoria();
+    else if (t === 'laminas') vistaLaminas();
+    else if (t === 'admin') vistaAdmin();
+    if (S.pintor) S.pintor();
+    window.scrollTo(0, y);
+  }
+
+  /* ======================= campos ======================= */
+  function attrs(o) {
+    return Object.keys(o).filter(function (k) { return o[k] !== undefined && o[k] !== null && o[k] !== false; }).map(function (k) {
+      return o[k] === true ? k : k + '="' + esc(o[k]) + '"';
+    }).join(' ');
+  }
+  /* Campo con etiqueta enlazado al modelo: b = {o, id, k, t, eq} */
+  function campo(label, b, valor, extra) {
+    extra = extra || {};
+    var a = Object.assign({ 'data-o': b.o, 'data-id': b.id, 'data-k': b.k, 'data-t': b.t, 'data-eq': b.eq, 'data-re': b.re }, extra.attrs || {});
+    var v = b.t === 'pct' && valor !== null && valor !== undefined && valor !== '' ? +(valor * 100).toFixed(4) : fmtN(valor);
+    var ctl;
+    if (extra.opciones) {
+      ctl = '<select ' + attrs(a) + '>' + extra.opciones + '</select>';
+    } else {
+      a.type = extra.type || (b.t ? 'number' : 'text');
+      if (a.type === 'number') a.step = 'any';
+      a.value = v;
+      ctl = '<input ' + attrs(a) + '>';
+    }
+    return '<label class="campo"' + (extra.span ? ' style="grid-column: span ' + extra.span + '"' : '') + '><span>' + esc(label) + '</span>' + ctl +
+      (extra.ayuda ? '<small>' + extra.ayuda + '</small>' : '') + '</label>';
+  }
+  function opts(lista, sel, vacio) {
+    var h = vacio !== undefined ? '<option value="">' + esc(vacio) + '</option>' : '';
+    var hay = false;
+    lista.forEach(function (x) {
+      var v = typeof x === 'object' ? x.v : x, l = typeof x === 'object' ? x.l : x;
+      if (v === sel) hay = true;
+      h += '<option value="' + esc(v) + '"' + (v === sel ? ' selected' : '') + '>' + esc(l) + '</option>';
+    });
+    if (sel && !hay) h += '<option value="' + esc(sel) + '" selected>' + esc(sel) + '</option>';
+    return h;
+  }
+  function optsFabricantes(sel) {
+    return opts(S.cat.fabricantes.map(function (f) { return { v: f.id, l: f.nombre }; }), sel);
+  }
+  function optsNiveles(sel) {
+    return opts(S.proy.niveles, sel, '— nivel —');
+  }
+  function optsModelo(fab, sel) {
+    var grupos = {}, orden = [];
+    Calc.dispositivosDe(S.cx, fab).forEach(function (d) {
+      var g = d.circuito || 'OTROS';
+      if (!grupos[g]) { grupos[g] = []; orden.push(g); }
+      grupos[g].push(d);
+    });
+    var h = '<option value="">— modelo —</option>';
+    orden.forEach(function (g) {
+      h += '<optgroup label="' + esc(g) + '">' + grupos[g].map(function (d) {
+        return '<option value="' + esc(d.id) + '"' + (d.id === sel ? ' selected' : '') + ' title="' + esc(d.descripcion) + '">' +
+          esc(etiquetaDisp(d)) + '</option>';
+      }).join('') + '</optgroup>';
+    });
+    if (sel && !S.cx.disp[sel]) h += '<option value="' + esc(sel) + '" selected>(no está en el catálogo)</option>';
+    else if (sel && S.cx.disp[sel].fabricante !== fab) {
+      var d = S.cx.disp[sel];
+      h += '<option value="' + esc(sel) + '" selected>' + esc(etiquetaDisp(d)) + '</option>';
+    }
+    return h;
+  }
+  /* Etiqueta del dispositivo en las listas: «código · qué es — descripción».
+   * Si el catálogo guardado es anterior al campo «tipo», se toma el del catálogo base. */
+  var TIPO_BASE = {};
+  (window.CATALOGO_BASE.dispositivos || []).forEach(function (d) { TIPO_BASE[d.id] = d.tipo || ''; });
+  function etiquetaDisp(d) {
+    var cod = d.modelo && d.modelo !== '—' ? d.modelo : '';
+    var tipo = d.tipo || TIPO_BASE[d.id] || '';
+    var desc = d.descripcion || d.tag || '';
+    var ini = cod && tipo ? cod + ' · ' + tipo : (cod || tipo);
+    return ini && desc ? ini + ' — ' + desc : (ini || desc);
+  }
+  function optsDispTodos(sel) {
+    var h = '<option value="">— sin modelo (0 mA) —</option>';
+    S.cat.fabricantes.forEach(function (f) {
+      var l = Calc.dispositivosDe(S.cx, f.id);
+      if (!l.length) return;
+      h += '<optgroup label="' + esc(f.nombre) + '">' + l.map(function (d) {
+        return '<option value="' + esc(d.id) + '"' + (d.id === sel ? ' selected' : '') + '>' + esc(etiquetaDisp(d)) + ' (' + fmt(d.iAlarma, 0) + ' mA)</option>';
+      }).join('') + '</optgroup>';
+    });
+    return h;
+  }
+  function optsCables(sel) {
+    return opts(S.cat.cables.map(function (c) {
+      return { v: c.id, l: c.fabricante + ' ' + c.modelo + ' (' + c.awg + ' AWG · ' + c.listado + ')' };
+    }), sel, '— cable —');
+  }
+  function optsEquipos(sel) {
+    var l = S.proy.paneles.map(function (p) { return { v: p.id, l: p.tag + (p.nivel ? ' · ' + p.nivel : '') }; })
+      .concat(S.proy.fuentes.map(function (f) { return { v: f.id, l: f.tag + (esAmp(f) ? ' (amplificador)' : ' (fuente)') }; }));
+    var h = opts(l, null, '— fuente / panel —');
+    if (sel) h = h.replace('value="' + esc(sel) + '"', 'value="' + esc(sel) + '" selected');
+    if (sel && !porId(S.proy.paneles, sel) && !porId(S.proy.fuentes, sel)) h += '<option value="' + esc(sel) + '" selected>(eliminado)</option>';
+    return h;
+  }
+
+  /* ======================= vista: Proyecto ======================= */
+  function vistaProyecto() {
+    var P = S.proy, pp = P.params;
+    var B = function (k, t, re) { return { o: 'proy', k: k, t: t, re: re }; };
+    var Bp = function (k, t) { return { o: 'params', k: k, t: t }; };
+    var h = [];
+    h.push('<div class="encabezado"><div><h2>' + esc(P.nombre || 'Proyecto') + '</h2>' +
+      '<div class="sub">Datos generales, parámetros de cálculo, niveles y equipos. Cada panel y fuente auxiliar crea su propia pestaña.</div></div>' +
+      '<div class="acciones"><button class="btn" data-act="ir" data-tab="memoria">Ver memoria de cálculo →</button></div></div>');
+
+    h.push('<div class="grid-2col"><div>');
+    // Información
+    h.push('<section class="card"><div class="card-h"><h3>Información del proyecto</h3><span class="nota">Entrada manual: campos con fondo azul tenue · cálculo automático: fondo gris</span></div><div class="card-b"><div class="grid c4">' +
+      '<div style="grid-column:1/-1">' + DatosProyecto.bloque(Store.proyecto()) + '</div>' +
+      campo('Versión', B('revision'), P.revision, { attrs: { placeholder: 'Ej.: 0, A, B' } }) +
+      campo('Fecha de emisión', B('fecha'), P.fecha, { type: 'date' }) +
+      campo('Fabricante principal', B('fabricante'), P.fabricante, { opciones: optsFabricantes(P.fabricante), ayuda: 'Valor inicial de filas nuevas' }) +
+      campo('Normativa', B('normativa'), P.normativa, { span: 4 }) +
+      '</div></div></section>');
+    h.push('</div><div>');
+    // Parámetros
+    h.push('<section class="card"><div class="card-h"><h3>Parámetros NFPA 72</h3><span class="nota">Aplican a todos los equipos salvo que el equipo los cambie</span></div><div class="card-b"><div class="grid c2">' +
+      campo('Tiempo de espera (h)', Bp('tEspera', 'num'), pp.tEspera, { ayuda: '§10.6.7.2.1: 24 h' }) +
+      campo('Tiempo de alarma (min)', Bp('tAlarma', 'num'), pp.tAlarma, { ayuda: '5 min alarma · 15 min voceo/EVACS', attrs: { list: 'dl-talarma' } }) +
+      campo('Factor de seguridad (%)', Bp('fs', 'pct'), pp.fs, { ayuda: 'Envejecimiento de baterías (fichas de fabricante)' }) +
+      campo('Tensión nominal (V)', Bp('vNominal', 'num'), pp.vNominal) +
+      campo('Fuente a fin de vida (%)', Bp('pctFinVida', 'pct'), pp.pctFinVida, { ayuda: '<span data-out="vfuente"></span>' }) +
+      campo('V mínima de dispositivo (V)', Bp('vMin', 'num'), pp.vMin, { ayuda: 'UL 1971/464 típico 16–33 V' }) +
+      campo('I máx. por circuito NAC (A)', Bp('iMaxNac', 'num'), pp.iMaxNac, { ayuda: '80 % de la capacidad del NAC' }) +
+      '</div><datalist id="dl-talarma"><option value="5"><option value="15"></datalist></div></section>');
+    h.push('</div></div>');
+
+    // Niveles
+    h.push('<section class="card"><div class="card-h"><h3>Niveles del edificio</h3><span class="nota">Cada nivel nuevo crea su pestaña de panel/transponder. También sirven como «Nivel / zona» de los dispositivos.</span></div><div class="card-b">' +
+      '<div class="chips">' + (P.niveles.length ? P.niveles.map(function (n, i) {
+        var pn = P.paneles.filter(function (x) { return x.nivel === n; }).map(function (x) { return x.tag; }).join(', ');
+        return '<span class="chip">' + esc(n) + (pn ? ' <span class="muted" style="color:var(--ink-3)">· ' + esc(pn) + '</span>' : '') +
+          '<button title="Quitar nivel" data-act="nivel-del" data-i="' + i + '">✕</button></span>';
+      }).join('') : '<span class="muted" style="color:var(--ink-3)">Sin niveles definidos.</span>') + '</div>' +
+      '<div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap">' +
+      '<button class="btn primary" data-act="nivel-nuevo">+ Agregar nivel</button>' +
+      '<button class="btn" data-act="niveles-rango">Agregar varios niveles…</button>' +
+      '</div></div></section>');
+
+    // Paneles
+    h.push('<section class="card"><div class="card-h"><h3>Paneles y transponders</h3>' +
+      '<div style="display:flex; gap:6px"><button class="btn btn-sm" data-act="panel-add" data-tipo="FACP">+ FACP</button><button class="btn btn-sm primary" data-act="panel-add" data-tipo="TRP">+ Transponder</button></div></div>' +
+      '<div class="card-b flush tabla-wrap">');
+    if (!P.paneles.length) {
+      h.push('<div class="vacio">Todavía no hay paneles. Agregue el FACP y los transponders (cada uno calcula su propia batería).</div>');
+    } else {
+      h.push('<table class="t"><thead><tr><th>TAG</th><th>Tipo</th><th>Nivel / ubicación</th><th>Descripción</th><th class="num">Disp.</th><th class="num">I espera (A)</th><th class="num">I alarma (A)</th><th class="num">Ah requerido</th><th class="num">Batería (Ah)</th><th>Estado</th><th></th></tr></thead><tbody>');
+      P.paneles.forEach(function (p) {
+        var b = function (k) { return 'data-o="panel" data-id="' + esc(p.id) + '" data-k="' + k + '"'; };
+        h.push('<tr><td><input class="in w-sm" ' + b('tag') + ' data-re="tabs" value="' + esc(p.tag) + '"></td>' +
+          '<td><select class="in w-sm" ' + b('tipo') + ' data-re="tabs">' + opts(['FACP', 'TRP'], p.tipo) + '</select></td>' +
+          '<td><select class="in w-md" ' + b('nivel') + ' data-re="tabs">' + optsNiveles(p.nivel) + '</select></td>' +
+          '<td><input class="in w-md" ' + b('descripcion') + ' value="' + esc(p.descripcion) + '" placeholder="Ej.: Panel principal"></td>' +
+          '<td class="calc num" data-out="n:' + p.id + '"></td><td class="calc num" data-out="ie:' + p.id + '"></td><td class="calc num" data-out="ia:' + p.id + '"></td>' +
+          '<td class="calc num" data-out="ah:' + p.id + '"></td><td class="calc num" data-out="bat:' + p.id + '"></td><td data-out="est:' + p.id + '"></td>' +
+          '<td style="white-space:nowrap"><button class="btn btn-sm" data-act="ir" data-tab="p:' + esc(p.id) + '">Abrir →</button>' +
+          '<button class="btn-icon" title="Duplicar" data-act="panel-dup" data-id="' + esc(p.id) + '">⧉</button>' +
+          '<button class="btn-icon del" title="Eliminar" data-act="panel-del" data-id="' + esc(p.id) + '">✕</button></td></tr>');
+      });
+      h.push('</tbody><tfoot><tr><td colspan="5">TOTAL SISTEMA</td><td class="num" data-out="tot-ie"></td><td class="num" data-out="tot-ia"></td><td class="num" data-out="tot-ah"></td><td colspan="3"></td></tr></tfoot></table>');
+    }
+    h.push('</div></section>');
+
+    // Fuentes
+    h.push('<section class="card"><div class="card-h"><h3>Fuentes de poder auxiliares</h3><button class="btn btn-sm primary" data-act="fuente-add">+ Fuente auxiliar</button></div><div class="card-b flush tabla-wrap">');
+    var soloFuentes = P.fuentes.filter(function (x) { return !esAmp(x); });
+    if (!soloFuentes.length) {
+      h.push('<div class="vacio">Sin fuentes auxiliares (NAC expander / bases sonoras). Agregue una si el proyecto la requiere.</div>');
+    } else {
+      h.push('<table class="t"><thead><tr><th>TAG</th><th>Nivel</th><th>Alimentada desde</th><th class="num">I máx. (A)</th><th class="num">I propia (A)</th><th class="num">I alarma (A)</th><th>Verificación 80 %</th><th class="num">Ah requerido</th><th class="num">Batería (Ah)</th><th>Estado</th><th></th></tr></thead><tbody>');
+      soloFuentes.forEach(function (f) {
+        var b = function (k, t) { return 'data-o="fuente" data-id="' + esc(f.id) + '" data-k="' + k + '"' + (t ? ' data-t="' + t + '" type="number" step="any"' : ''); };
+        h.push('<tr><td><input class="in w-sm" ' + b('tag') + ' data-re="tabs" value="' + esc(f.tag) + '"></td>' +
+          '<td><select class="in w-md" ' + b('nivel') + '>' + optsNiveles(f.nivel) + '</select></td>' +
+          '<td><select class="in w-sm" ' + b('panelId') + '>' + opts(P.paneles.map(function (p) { return { v: p.id, l: p.tag }; }), f.panelId, '—') + '</select></td>' +
+          '<td><input class="in w-xs" ' + b('iMax', 'num') + ' value="' + fmtN(f.iMax) + '"></td>' +
+          '<td><input class="in w-xs" ' + b('iPropia', 'num') + ' value="' + fmtN(f.iPropia) + '"></td>' +
+          '<td class="calc num" data-out="ia:' + f.id + '"></td><td data-out="ver:' + f.id + '"></td>' +
+          '<td class="calc num" data-out="ah:' + f.id + '"></td><td class="calc num" data-out="bat:' + f.id + '"></td><td data-out="est:' + f.id + '"></td>' +
+          '<td style="white-space:nowrap"><button class="btn btn-sm" data-act="ir" data-tab="f:' + esc(f.id) + '">Abrir →</button>' +
+          '<button class="btn-icon" title="Duplicar" data-act="fuente-dup" data-id="' + esc(f.id) + '">⧉</button>' +
+          '<button class="btn-icon del" title="Eliminar" data-act="fuente-del" data-id="' + esc(f.id) + '">✕</button></td></tr>');
+      });
+      h.push('</tbody></table>');
+    }
+    h.push('</div></section>');
+
+    // Amplificadores de voceo
+    var amps = P.fuentes.filter(esAmp);
+    h.push('<section class="card"><div class="card-h"><h3>Amplificadores de voceo</h3><button class="btn btn-sm primary" data-act="amp-add">+ Amplificador</button></div><div class="card-b flush tabla-wrap">');
+    if (!amps.length) {
+      h.push('<div class="vacio">Sin amplificadores. Agregue uno por cada amplificador de voceo / evacuación por voz (sus parlantes se asignan en su pestaña a un lazo de voceo).</div>');
+    } else {
+      h.push('<table class="t"><thead><tr><th>TAG</th><th>Nivel</th><th>Alimentado desde</th><th class="num">I máx. ficha (A)</th><th class="num">I espera propia (A)</th><th class="num">I alarma total (A)</th><th>Verificación</th><th class="num">Ah requerido</th><th class="num">Batería (Ah)</th><th>Estado</th><th></th></tr></thead><tbody>');
+      amps.forEach(function (f) {
+        var b = function (k, t) { return 'data-o="fuente" data-id="' + esc(f.id) + '" data-k="' + k + '"' + (t ? ' data-t="' + t + '" type="number" step="any"' : ''); };
+        h.push('<tr><td><input class="in w-sm" ' + b('tag') + ' data-re="tabs" value="' + esc(f.tag) + '"></td>' +
+          '<td><select class="in w-md" ' + b('nivel') + '>' + optsNiveles(f.nivel) + '</select></td>' +
+          '<td><select class="in w-sm" ' + b('panelId') + '>' + opts(P.paneles.map(function (p) { return { v: p.id, l: p.tag }; }), f.panelId, '—') + '</select></td>' +
+          '<td><input class="in w-xs" ' + b('iMax', 'num') + ' value="' + fmtN(f.iMax) + '" placeholder="Ej.: 6"></td>' +
+          '<td><input class="in w-xs" ' + b('iPropia', 'num') + ' value="' + fmtN(f.iPropia) + '" placeholder="Ej.: 0.1"></td>' +
+          '<td class="calc num" data-out="ia:' + f.id + '"></td><td data-out="ver:' + f.id + '"></td>' +
+          '<td class="calc num" data-out="ah:' + f.id + '"></td><td class="calc num" data-out="bat:' + f.id + '"></td><td data-out="est:' + f.id + '"></td>' +
+          '<td style="white-space:nowrap"><button class="btn btn-sm" data-act="ir" data-tab="f:' + esc(f.id) + '">Abrir →</button>' +
+          '<button class="btn-icon" title="Duplicar" data-act="fuente-dup" data-id="' + esc(f.id) + '">⧉</button>' +
+          '<button class="btn-icon del" title="Eliminar" data-act="fuente-del" data-id="' + esc(f.id) + '">✕</button></td></tr>');
+      });
+      h.push('</tbody></table>');
+    }
+    h.push('</div></section>');
+    vista.innerHTML = h.join('');
+
+    S.pintor = function () {
+      var R = Calc.proyecto(S.cx, P);
+      out('vfuente', '= ' + fmt(R.caida.params.vFuente, 2) + ' V de fuente degradada');
+      R.paneles.forEach(function (x) {
+        var id = x.p.id;
+        out('n:' + id, (x.p.filas || []).reduce(function (s, f) { return s + (Calc.num(f.cant) || 0); }, 0));
+        out('ie:' + id, fmt(x.r.iEsp, 3));
+        out('ia:' + id, fmt(x.r.iAlm, 3));
+        out('ah:' + id, fmt(x.r.bat.ahReq, 2));
+        out('bat:' + id, x.r.bat.ah !== null ? fmt(x.r.bat.ah, 1) : '<span class="aviso error">excede BD</span>');
+        out('est:' + id, badge(x.r.estado));
+      });
+      out('tot-ie', fmt(R.totalPaneles.iEsp, 3));
+      out('tot-ia', fmt(R.totalPaneles.iAlm, 3));
+      out('tot-ah', fmt(R.totalPaneles.ahReq, 2));
+      R.fuentes.forEach(function (x) {
+        var id = x.f.id;
+        out('ia:' + id, fmt(x.r.iAlm, 3));
+        out('ver:' + id, badge(x.r.verificacion));
+        out('ah:' + id, fmt(x.r.bat.ahReq, 2));
+        out('bat:' + id, x.r.bat.ah !== null ? fmt(x.r.bat.ah, 1) : '<span class="aviso error">excede BD</span>');
+        out('est:' + id, badge(x.r.estado));
+      });
+    };
+  }
+
+  /* ======================= vista: Panel / Fuente ======================= */
+  function vistaEquipo(ref) {
+    var esF = ref.charAt(0) === 'f';
+    var eq = equipo(ref), P = S.proy;
+    var o = esF ? 'fuente' : 'panel';
+    var B = function (k, t, re) { return { o: o, id: eq.id, k: k, t: t, re: re }; };
+    var pp = P.params;
+    var h = [];
+    var esA = esF && esAmp(eq);
+    var titulo = esA ? 'Amplificador ' + eq.tag : esF ? 'Fuente auxiliar ' + eq.tag : (eq.tipo === 'FACP' ? 'Panel ' : 'Transponder ') + eq.tag;
+    h.push('<div class="encabezado"><div><h2>' + esc(titulo) + (eq.nivel ? ' · ' + esc(eq.nivel) : '') + '</h2>' +
+      '<div class="sub">' + (esA ? 'Cálculo de batería del amplificador de voceo — NFPA 72:2022 §10.6.7. Los parlantes de sus lazos de voceo (de cualquier nivel o panel) se cargan aquí y no al panel.' : esF ? 'Cálculo de fuente de poder auxiliar (NAC expander / bases sonoras) — NFPA 72:2022'
+        : 'Cálculo de baterías — NFPA 72:2022 §10.6.7. Cada panel/transponder calcula su propia batería (respalda solo su carga local).') + '</div></div>' +
+      '<div class="acciones"><button class="btn" data-act="ir" data-tab="proyecto">← Proyecto</button>' +
+      '<button class="btn danger" data-act="' + o + '-del" data-id="' + esc(eq.id) + '">Eliminar ' + (esA ? 'amplificador' : esF ? 'fuente' : 'panel') + '</button></div></div>');
+
+    // Datos del equipo
+    h.push('<section class="card"><div class="card-h"><h3>Datos del equipo</h3><span class="nota">Parámetros vacíos = se usa el valor del proyecto (en gris)</span></div><div class="card-b"><div class="grid c4">' +
+      campo(esA ? 'Amplificador / TAG' : esF ? 'Fuente / TAG' : 'Panel / TAG', B('tag', null, 'tabs'), eq.tag) +
+      (esF ? campo(esA ? 'Alimentado desde' : 'Alimentada desde', B('panelId'), eq.panelId, { opciones: opts(P.paneles.map(function (p) { return { v: p.id, l: p.tag }; }), eq.panelId, '—') })
+        : campo('Tipo', B('tipo', null, 'tabs'), eq.tipo, { opciones: opts([{ v: 'FACP', l: 'FACP — panel principal' }, { v: 'TRP', l: 'TRP — transponder' }], eq.tipo) })) +
+      campo('Nivel / ubicación', B('nivel', null, 'tabs'), eq.nivel, { opciones: optsNiveles(eq.nivel) }) +
+      campo('Descripción', B('descripcion'), eq.descripcion, { attrs: { placeholder: 'Ej.: Panel principal, sala de control' } }) +
+      campo('Tiempo de espera (h)', B('tEspera', 'num'), eq.tEspera, { attrs: { placeholder: pp.tEspera } }) +
+      campo('Tiempo de alarma (min)', B('tAlarma', 'num'), eq.tAlarma, { attrs: { placeholder: pp.tAlarma, list: 'dl-talarma' }, ayuda: '5 min alarma · 15 min voceo/EVACS' }) +
+      campo('Factor de seguridad (%)', B('fs', 'pct'), eq.fs, { attrs: { placeholder: +(pp.fs * 100).toFixed(2) } }) +
+      (esA ? campo('I máx. (A) — ficha, plena potencia', B('iMax', 'num'), eq.iMax, { ayuda: 'Capacidad del amplificador a 24 VDC. La carga real sale de los parlantes en sus lazos de voceo; si no hay parlantes se usa este valor' }) +
+        campo('I propia (A) — ficha', B('iPropia', 'num'), eq.iPropia, { ayuda: 'Consumo propio del amplificador; se suma en espera y en alarma' })
+        : esF ? campo('I máx. fuente (A) — ficha', B('iMax', 'num'), eq.iMax, { ayuda: 'Ej.: Notifier FCPS-24S8 = 8 A. Se limita al 80 %' }) +
+        campo('I propia de la fuente (A)', B('iPropia', 'num'), eq.iPropia, { ayuda: 'Se suma en espera y en alarma' }) : '') +
+      '</div><datalist id="dl-talarma"><option value="5"><option value="15"></datalist></div></section>');
+
+    // Lazos y salidas del equipo
+    var lazos = lazosDe(eq.id);
+    h.push('<section class="card"><div class="card-h"><h3>Lazos y salidas de este equipo</h3>' +
+      '<span class="nota">Defina los SLC, NAC, IDNAC y circuitos de 24 VDC que salen del equipo; luego asigne cada dispositivo a su lazo. La caída de tensión usa estos lazos.</span></div>' +
+      '<div class="card-b flush tabla-wrap"><table class="t"><thead><tr><th>Lazo / salida</th><th>Tipo</th><th>Clase</th><th>Nivel</th><th>Alimentado por</th><th>Cable</th><th class="num">Long. ida (m)</th>' +
+      '<th class="num">Disp.</th><th class="num">I alarma (mA)</th><th class="num">V disp. (V)</th><th>Estado</th><th></th></tr></thead><tbody>' +
+      (lazos.length ? lazos.map(function (c) {
+        var b = function (k, t) { return 'data-o="circ" data-id="' + esc(c.id) + '" data-k="' + k + '"' + (t ? ' data-t="' + t + '" type="number" step="any"' : ''); };
+        return '<tr><td><input class="in w-sm" ' + b('circuito') + ' data-re="vista" value="' + esc(c.circuito) + '" placeholder="Ej.: SLC 1"></td>' +
+          '<td><select class="in w-sm" ' + b('tipo') + ' data-re="vista">' + optsTiposLazo(c.tipo) + '</select></td>' +
+          celdaClase(c) +
+          '<td><select class="in w-md" ' + b('nivel') + ' data-re="vista">' + optsNiveles(c.nivel) + '</select></td>' +
+          celdaAlim(c) +
+          '<td><select class="in w-md" ' + b('cable') + '>' + optsCables(c.cable) + '</select></td>' +
+          '<td><input class="in w-xs" min="0" ' + b('long', 'num') + ' value="' + fmtN(c.long) + '" placeholder="150"></td>' +
+          '<td class="calc num" data-out="n:' + c.id + '"></td><td class="calc num" data-out="i:' + c.id + '"></td><td class="calc num" data-out="vd:' + c.id + '"></td>' +
+          '<td data-out="es:' + c.id + '"></td>' +
+          '<td><button class="btn-icon del" title="Eliminar lazo" data-act="circ-del" data-id="' + esc(c.id) + '">✕</button></td></tr>';
+      }).join('') : '<tr><td colspan="12" class="vacio">Sin lazos. Agregue los que salen de este equipo (SLC, NAC, 24 VDC…) para poder asignar los dispositivos.</td></tr>') +
+      '</tbody></table></div><div class="card-b" style="display:flex; gap:8px; flex-wrap:wrap; border-top:1px solid var(--border)">' +
+      Calc.TIPOS_LAZO.map(function (t) { return '<button class="btn btn-sm" data-act="lazo-add" data-eq="' + esc(eq.id) + '" data-tipo="' + t + '"' + (t === 'NAC+VOCEO' ? ' title="NAC y voceo en la misma tubería"' : (t === 'SLC+24V' ? ' title="SLC y 24 V en la misma tubería (dispositivos que van al SLC y requieren alimentación)"' : '')) + '>+ ' + esc(etiquetaTipo(t)) + '</button>'; }).join('') +
+      '</div></section>');
+
+    // Lazos de otros equipos que carga esta fuente / amplificador
+    if (esF) {
+      var cdq = Calc.caida(S.cx, P), cg = [];
+      P.caida.circuitos.forEach(function (c, i) {
+        var ef = (c.alim && porId(P.fuentes, c.alim)) ? c.alim : c.fuente;
+        if (ef === eq.id && c.fuente !== eq.id) cg.push({ c: c, r: cdq.circuitos[i] });
+      });
+      h.push('<section class="card"><div class="card-h"><h3>Lazos de otros niveles que carga ' + esc(eq.tag) + '</h3>' +
+        '<span class="nota">Se asignan en la columna «Alimentado por» de cada lazo. Los dispositivos de esos lazos se suman a la batería y a la capacidad de este equipo (no a las del panel).</span></div>' +
+        '<div class="card-b flush tabla-wrap"><table class="t"><thead><tr><th>Lazo</th><th>Origen</th><th>Tipo</th><th>Nivel</th><th class="num">Disp.</th><th class="num">I alarma (mA)</th></tr></thead><tbody>' +
+        (cg.length ? cg.map(function (x) {
+          var o = porId(P.paneles, x.c.fuente) || porId(P.fuentes, x.c.fuente);
+          return '<tr><td>' + esc(x.c.circuito) + '</td><td>' + esc(o ? o.tag : '') + '</td><td>' + esc(etiquetaTipo(x.c.tipo)) + '</td><td>' + esc(x.c.nivel || '') + '</td>' +
+            '<td class="num">' + (x.r.n ? fmt(x.r.n, 0) : '—') + '</td><td class="num">' + (x.r.iMa === null ? '—' : fmt(x.r.iMa, 1)) + '</td></tr>';
+        }).join('') : '<tr><td colspan="6" class="vacio">Ningún lazo de otro equipo está asignado a ' + esc(eq.tag) + '. En la pestaña de cada panel, elija «Alimentado por» en sus lazos.</td></tr>') +
+        '</tbody></table></div></section>');
+    }
+
+    // Dispositivos de OTROS equipos (otros niveles) conectados a lazos de este equipo: su carga se suma aquí
+    var ajenas = [];
+    P.paneles.concat(P.fuentes).forEach(function (o) {
+      if (o === eq) return;
+      (o.filas || []).forEach(function (fl) {
+        var cz = fl.circ && porId(P.caida.circuitos, fl.circ);
+        if (cz && cz.fuente === eq.id && (fl.disp || Calc.num(fl.cant) !== null)) ajenas.push({ o: o, f: fl, c: cz });
+      });
+    });
+    if (ajenas.length) {
+      h.push('<section class="card"><div class="card-h"><h3>Dispositivos de otros niveles conectados a lazos de ' + esc(eq.tag) + '</h3>' +
+        '<span class="nota">Se editan en la pestaña de su nivel o equipo; su corriente se suma a la batería de ' + esc(eq.tag) + ' y no a la de ese equipo.</span></div>' +
+        '<div class="card-b flush tabla-wrap"><table class="t"><thead><tr><th>Equipo / nivel</th><th>Modelo / descripción</th><th>Lazo</th><th class="num">Cant.</th><th class="num">I alarma (A)</th><th></th></tr></thead><tbody>' +
+        ajenas.map(function (x) {
+          var d = S.cx.disp[x.f.disp], r = Calc.fila(S.cx, x.f), ref = (porId(P.paneles, x.o.id) ? 'p:' : 'f:') + x.o.id;
+          return '<tr><td>' + esc(x.o.tag) + ' · ' + esc(x.f.zona || x.o.nivel || '') + '</td><td>' + esc(d ? etiquetaDisp(d) : '— sin modelo —') + '</td><td>' + esc(x.c.circuito) + '</td>' +
+            '<td class="num">' + fmt(Calc.num(x.f.cant), 0) + '</td><td class="num">' + (r.iAlmT === null ? '—' : fmt(r.iAlmT, 4)) + '</td>' +
+            '<td><button class="btn btn-sm" data-act="ir" data-tab="' + esc(ref) + '">Abrir →</button></td></tr>';
+        }).join('') + '</tbody></table></div></section>');
+    }
+
+    // Dispositivos
+    h.push('<section class="card"><div class="card-h"><h3>Dispositivos conectados</h3>' +
+      '<span class="nota">Flujo: 1) Fabricante → 2) Modelo → 3) Nivel y lazo → 4) Cantidad. ' + (esF ? '' : 'Incluya el consumo del panel/transponder como primera fila. ') +
+      'Las corrientes unitarias vienen del catálogo; si digita un valor, reemplaza el de catálogo (amarillo).</span></div>' +
+      '<div class="card-b flush tabla-wrap"><table class="t"><thead><tr><th class="idx">#</th><th>Fabricante</th><th>Modelo / descripción</th><th>TAG</th><th>Nivel</th><th>Lazo / salida</th>' +
+      '<th class="num">Cant.</th><th class="num">I espera unit. (mA)</th><th class="num">I espera total (A)</th><th class="num">I alarma unit. (mA)</th><th class="num">I alarma total (A)</th><th>Observación</th><th></th><th></th></tr></thead><tbody>');
+    eq.filas.forEach(function (f, i) { h.push(filaHTML(ref, f, i)); });
+    if (!eq.filas.length) h.push('<tr><td colspan="14" class="vacio">Sin dispositivos. Use «+ Fila» para comenzar.</td></tr>');
+    h.push('</tbody><tfoot><tr><td colspan="8" style="text-align:right">TOTALES' + (esF ? ' (incluye consumo propio de la fuente)' : '') + ':</td>' +
+      '<td class="num" data-out="tot-ie"></td><td></td><td class="num" data-out="tot-ia"></td><td colspan="3"></td></tr></tfoot></table></div>' +
+      '<div class="card-b" style="display:flex; gap:8px; flex-wrap:wrap; border-top:1px solid var(--line)">' +
+      '<button class="btn primary btn-sm" data-act="fila-add" data-n="1">+ Fila</button><button class="btn btn-sm" data-act="fila-add" data-n="5">+ 5 filas</button>' +
+      '<button class="btn btn-sm" data-act="filas-limpiar">Quitar filas vacías</button>' +
+      '<button class="btn btn-sm" data-act="copiar-nivel" title="Copia los lazos y dispositivos de otro nivel a este, ligados a este nivel">⧉ Copiar de otro nivel</button></div></section>');
+
+    // Cálculo de batería
+    h.push('<div class="grid-2col"><section class="card"><div class="card-h"><h3>Cálculo de capacidad de batería</h3><span class="nota">NFPA 72:2022 §10.6.7 / UL 864</span></div>' +
+      '<div class="card-b" data-out="bateria"></div></section><div>');
+    if (esF) h.push('<section class="card"><div class="card-h"><h3>Verificación de capacidad de la fuente</h3></div><div class="card-b" data-out="verif"></div></section>');
+    h.push('<div class="ayuda"><b>Configuración:</b> 2 baterías de 12 V en serie = 24 VDC. Verifique dimensiones contra el gabinete y la capacidad máxima del cargador ' +
+      (esF ? 'de la fuente' : 'del panel') + ' según ficha. La selección toma la capacidad estándar inmediata superior del catálogo de baterías.</div></div></div>');
+    vista.innerHTML = h.join('');
+
+    S.pintor = function () {
+      var r = esF ? Calc.fuente(S.cx, eq, P) : Calc.panel(S.cx, eq, P);
+      eq.filas.forEach(function (f, i) {
+        var x = r.filas[i];
+        out('tag:' + f.id, esc(x.tag));
+        out('desc:' + f.id, esc(x.descripcion));
+        out('ie:' + f.id, x.iEspT === null ? '' : fmt(x.iEspT, 4));
+        out('ia:' + f.id, x.iAlmT === null ? '' : fmt(x.iAlmT, 4));
+        out('av:' + f.id, x.aviso ? '<span class="aviso ' + x.nivel + '" title="' + esc(x.aviso) + '">' + (x.nivel === 'error' ? '❌ ' : (x.nivel === 'info' ? 'ℹ ' : '⚠ ')) + esc(x.aviso) + '</span>' : '');
+        var tr = vista.querySelector('tr[data-fila="' + f.id + '"]');
+        if (tr) {
+          tr.classList.toggle('aviso-error', x.nivel === 'error');
+          tr.querySelectorAll('[data-k="iEsp"],[data-k="iAlm"]').forEach(function (inp) { inp.classList.toggle('editado', inp.value.trim() !== ''); });
+        }
+      });
+      var RC = Calc.caida(S.cx, P);
+      P.caida.circuitos.forEach(function (c, i) {
+        if (c.fuente !== eq.id) return;
+        var q = RC.circuitos[i];
+        out('n:' + c.id, q.n ? fmt(q.n, 0) : '—');
+        out('i:' + c.id, q.iMa === null ? '—' : fmt(q.iMa, 1));
+        out('vd:' + c.id, q.vDisp === null ? '—' : fmt(q.vDisp, 2));
+        out('es:' + c.id, q.estado ? badge(q.estado) : '—');
+      });
+      out('tot-ie', fmt(r.iEsp, 4));
+      out('tot-ia', fmt(r.iAlm, 4));
+      out('bateria', bloqueBateria(r.bat, r.errores));
+      if (esF) {
+        out('verif', '<div class="calc-lista">' +
+          '<div>I total en alarma (A)</div><div class="v">' + fmt(r.iAlm, 3) + '</div><div class="u">A</div>' +
+          '<div>I máx. permitida = 80 % × I máx</div><div class="v">' + fmt(r.iPermitida, 3) + '</div><div class="u">A</div>' +
+          '<div>Verificación de corriente</div><div class="v" style="grid-column: span 2">' + badge(r.verificacion) + '</div></div>');
+      }
+      renderTabs();
+    };
+  }
+
+  /* ======================= buscador de modelos (escribir y filtrar) ======================= */
+  var comboEl = null, comboCtx = null, comboAct = -1;
+  function normB(t) { return String(t === null || t === undefined ? '' : t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase(); }
+  function pajarDisp(d) {
+    var f = S.cx.fabricantes[d.fabricante];
+    return normB([f && f.nombre, d.modelo, d.tag, d.tipo || TIPO_BASE[d.id], d.descripcion, d.circuito].join(' '));
+  }
+  function listaCombo(q, fabActual) {
+    var tk = normB(q).split(/\s+/).filter(Boolean);
+    var l = S.cat.dispositivos.filter(function (d) { var h = pajarDisp(d); return tk.every(function (t) { return h.indexOf(t) >= 0; }); });
+    l.sort(function (a, b) { return (b.fabricante === fabActual) - (a.fabricante === fabActual); });
+    return l;
+  }
+  function pintarCombo(q) {
+    if (!comboEl || !comboCtx) return;
+    var eq = equipo(comboCtx.eq), f = eq && porId(eq.filas, comboCtx.id), fab = f ? f.fab : '';
+    var l = listaCombo(q, fab), max = 60;
+    comboAct = -1;
+    comboEl.innerHTML = '<button type="button" data-did="" class="combo-it combo-vacio">— sin modelo (0 mA) —</button>' + l.slice(0, max).map(function (d) {
+      var fn = S.cx.fabricantes[d.fabricante];
+      return '<button type="button" data-did="' + esc(d.id) + '" class="combo-it"><span class="combo-fab">' + esc(fn ? fn.nombre : '') + '</span> ' + esc(etiquetaDisp(d)) +
+        ' <span class="combo-ma">' + (d.iAlarma === null || d.iAlarma === undefined ? 'sin dato' : fmt(d.iAlarma, 1) + ' mA') + '</span></button>';
+    }).join('') + (l.length > max ? '<div class="combo-mas">' + (l.length - max) + ' más: siga escribiendo para afinar</div>' : '') + (!l.length ? '<div class="combo-mas">Sin resultados para «' + esc(q) + '»</div>' : '');
+  }
+  function abrirCombo(inp) {
+    if (!comboEl) {
+      comboEl = document.createElement('div'); comboEl.id = 'comboLista'; comboEl.className = 'combo-lista'; document.body.appendChild(comboEl);
+      comboEl.addEventListener('mousedown', function (e) {
+        e.preventDefault();
+        var b = e.target.closest('[data-did]');
+        if (b && comboCtx) elegirDisp(comboCtx.eq, comboCtx.id, b.getAttribute('data-did'));
+      });
+    }
+    comboCtx = { inp: inp, eq: inp.getAttribute('data-eq'), id: inp.getAttribute('data-id') };
+    var r = inp.getBoundingClientRect();
+    comboEl.style.left = Math.max(4, Math.min(r.left, window.innerWidth - 560)) + 'px';
+    comboEl.style.top = (r.bottom + 2) + 'px';
+    comboEl.style.minWidth = Math.max(r.width, 520) + 'px';
+    comboEl.style.maxHeight = Math.max(160, window.innerHeight - r.bottom - 16) + 'px';
+    comboEl.style.display = 'block';
+    pintarCombo(inp.value === inp.getAttribute('data-label') ? '' : inp.value);
+  }
+  function cerrarCombo() {
+    if (comboEl) comboEl.style.display = 'none';
+    if (comboCtx && comboCtx.inp) comboCtx.inp.value = comboCtx.inp.getAttribute('data-label') || '';
+    comboCtx = null;
+  }
+  function elegirDisp(eqRef, filaId, did) {
+    var eq = equipo(eqRef), f = eq && porId(eq.filas, filaId), d = did ? S.cx.disp[did] : null;
+    if (!f) return;
+    f.disp = did || '';
+    if (d) f.fab = d.fabricante;
+    f.iEsp = null; f.iAlm = null; f.t2 = ''; f.circ2 = '';
+    if (comboEl) comboEl.style.display = 'none';
+    comboCtx = null;
+    proyectoCambiado(); renderVista();
+  }
+  document.addEventListener('focusin', function (e) {
+    var t = e.target;
+    if (t && t.getAttribute && t.getAttribute('data-combo')) { t.select(); abrirCombo(t); }
+  });
+  document.addEventListener('input', function (e) {
+    var t = e.target;
+    if (t && t.getAttribute && t.getAttribute('data-combo')) { if (!comboCtx || comboCtx.inp !== t) abrirCombo(t); pintarCombo(t.value); }
+  });
+  document.addEventListener('focusout', function (e) {
+    var t = e.target;
+    if (t && t.getAttribute && t.getAttribute('data-combo')) setTimeout(function () { if (comboCtx && comboCtx.inp === t) cerrarCombo(); }, 120);
+  });
+  document.addEventListener('keydown', function (e) {
+    var t = e.target;
+    if (!t || !t.getAttribute || !t.getAttribute('data-combo') || !comboCtx) return;
+    var its = comboEl ? [].slice.call(comboEl.querySelectorAll('.combo-it')) : [];
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      comboAct = Math.max(0, Math.min(its.length - 1, comboAct + (e.key === 'ArrowDown' ? 1 : -1)));
+      its.forEach(function (b, i) { b.classList.toggle('activo', i === comboAct); });
+      if (its[comboAct]) its[comboAct].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      var b = its[comboAct >= 0 ? comboAct : (its.length > 1 ? 1 : 0)];
+      if (b) elegirDisp(comboCtx.eq, comboCtx.id, b.getAttribute('data-did'));
+    } else if (e.key === 'Escape') { cerrarCombo(); t.blur(); }
+  });
+
+  function filaHTML(ref, f, i, nivelVista) {
+    var d = S.cx.disp[f.disp], d2 = Calc.dispFila(d, f);
+    var b = function (k, t) { return 'data-o="fila" data-eq="' + esc(ref) + '" data-id="' + esc(f.id) + '" data-k="' + k + '"' + (t ? ' data-t="' + t + '"' : ''); };
+    return '<tr data-fila="' + esc(f.id) + '"><td class="idx">' + (i + 1) + '</td>' +
+      '<td><select class="in w-sm" ' + b('fab') + ' data-re="vista">' + optsFabricantes(f.fab) + '</select></td>' +
+      '<td><input class="in w-xl" type="text" autocomplete="off" data-combo="1" data-eq="' + esc(ref) + '" data-id="' + esc(f.id) + '" data-label="' + esc(d ? etiquetaDisp(d) : '') + '" value="' + esc(d ? etiquetaDisp(d) : '') + '" placeholder="— escriba para buscar: modelo, tag, descripción, fabricante —" title="Escriba para filtrar (por ejemplo: jack, estrobo, 4098, CO)"></td>' +
+      '<td class="calc" data-out="tag:' + f.id + '"></td>' +
+      '<td><select class="in w-md" ' + b('zona') + '>' + optsNiveles(f.zona) + '</select></td>' +
+      '<td><select class="in w-md" ' + b('circ') + '>' + optsLazosNivel(equipo(ref), f.circ, f.zona, d2) + '</select>' +
+      (d2 && Calc.tipoLazo2De(d2) ? '<select class="in w-md" style="margin-top:.25rem" title="Este dispositivo se conecta también a un lazo de ' + esc(Calc.tipoLazo2De(d2)) + (Calc.parNacVoceo(d2) ? ' (o use un solo lazo NAC+Voceo)' : (Calc.tipoLazo2De(d2) === '24VDC' && Calc.tipoLazoDe(d2) === 'SLC' ? ' (o use un solo lazo SLC+24V)' : '')) + '" ' + b('circ2') + '>' +
+        optsLazosTipo(equipo(ref), f.circ2, Calc.tipoLazo2De(d2)) + '</select>' : '') +
+      (d && !d.circuito2 && d.circuito !== 'NAC+VOCEO' ? (f.t2
+        ? '<a href="#" class="muted" style="display:block;font-size:.75em;margin-top:.15rem" data-act="t2-off" data-eq="' + esc(ref) + '" data-id="' + esc(f.id) + '" title="Quitar el 2.º lazo de este dispositivo">✕ quitar 2.º lazo</a>'
+        : '<a href="#" class="muted" style="display:block;font-size:.75em;margin-top:.15rem" data-act="t2-on" data-eq="' + esc(ref) + '" data-id="' + esc(f.id) + '" title="Conectar este dispositivo también a un lazo de 24 VDC (p. ej. un SLC que requiere alimentación)">＋ 2.º lazo (24 VDC)</a>') : '') + '</td>' +
+      '<td><input class="in w-xs" type="number" min="0" step="1" ' + b('cant', 'num') + ' value="' + fmtN(f.cant) + '" placeholder="10"></td>' +
+      '<td><input class="in w-xs" type="number" step="any" ' + b('iEsp', 'num') + ' value="' + fmtN(f.iEsp) + '" placeholder="' + (d ? fmtN(d.iEspera) : '') + '"></td>' +
+      '<td class="calc num" data-out="ie:' + f.id + '"></td>' +
+      '<td><input class="in w-xs" type="number" step="any" ' + b('iAlm', 'num') + ' value="' + fmtN(f.iAlm) + '" placeholder="' + (d ? fmtN(d.iAlarma) : '') + '"></td>' +
+      '<td class="calc num" data-out="ia:' + f.id + '"></td>' +
+      '<td><input class="in w-md" ' + b('obs') + ' value="' + esc(f.obs) + '" placeholder="Ej.: Torre A"></td>' +
+      '<td data-out="av:' + f.id + '"></td>' +
+      '<td style="white-space:nowrap"><button class="btn-icon" title="Duplicar fila" data-act="fila-dup" data-id="' + esc(f.id) + '">⧉</button>' +
+      '<button class="btn-icon del" title="Eliminar fila" data-act="fila-del" data-id="' + esc(f.id) + '">✕</button></td></tr>';
+  }
+
+  function bloqueBateria(b, errores) {
+    var fila = function (l, v, u, f) {
+      return '<div>' + l + '</div><div class="v">' + v + '</div><div class="u">' + (u || '') + '</div>' + (f ? '<div class="f">' + f + '</div>' : '');
+    };
+    var h = '<div class="calc-lista">' +
+      fila('Corriente total en espera', fmt(b.iEsp, 4), 'A') +
+      fila('Tiempo de espera', fmt(b.tEsp, 1), 'h') +
+      fila('Capacidad en espera', fmt(b.ahEsp, 3), 'Ah', 'Ah_espera = I_espera × t_espera') +
+      fila('Corriente total en alarma', fmt(b.iAlm, 4), 'A') +
+      fila('Tiempo de alarma', fmt(b.tAlmMin / 60, 4), 'h', fmt(b.tAlmMin, 0) + ' min ÷ 60') +
+      fila('Capacidad en alarma', fmt(b.ahAlm, 3), 'Ah', 'Ah_alarma = I_alarma × t_alarma') +
+      fila('Capacidad calculada', fmt(b.ahCalc, 3), 'Ah') +
+      fila('Factor de seguridad', fmt(b.fs * 100, 0), '%') +
+      fila('<b>Capacidad mínima requerida</b>', '<b>' + fmt(b.ahReq, 3) + '</b>', 'Ah', 'Ah_req = (Ah_espera + Ah_alarma) × (1 + FS)') +
+      '</div>';
+    if (b.bateria) {
+      h += '<div class="resultado' + (errores ? ' error' : '') + '"><div class="grande">' + fmt(b.ah, 1) + ' <small>Ah</small></div>' +
+        '<div class="det">Batería seleccionada (estándar) · <b>2 × 12 V</b><br>Referencia Simplex / Notifier-PS: <b>' + esc(b.referencia) + '</b>' +
+        (b.bateria.obs ? '<br>' + esc(b.bateria.obs) : '') +
+        (errores ? '<br><span class="aviso error">❌ Hay ' + errores + ' fila(s) con error en la tabla de dispositivos.</span>' : '') + '</div></div>';
+    } else {
+      h += '<div class="resultado error"><div class="grande">—</div><div class="det"><b>REVISAR:</b> la capacidad requerida excede la mayor batería del catálogo. ' +
+        'Divida la carga (fuente/transponder adicional) o use un cargador externo listado.</div></div>';
+    }
+    return h;
+  }
+
+  /* ======================= vista: Caída de tensión ======================= */
+  /* ======================= vista: Nivel sin panel ======================= */
+  function dispositivosEnNivel(nombre) {
+    var l = [];
+    S.proy.paneles.concat(S.proy.fuentes).forEach(function (eq) {
+      (eq.filas || []).forEach(function (f) { if (f.zona === nombre && (f.disp || Calc.num(f.cant) !== null)) l.push({ eq: eq, f: f }); });
+    });
+    return l;
+  }
+  function equipoDeFila(id) {
+    var r = null;
+    S.proy.paneles.concat(S.proy.fuentes).forEach(function (e) { if ((e.filas || []).some(function (f) { return f.id === id; })) r = e; });
+    return r;
+  }
+  function vistaNivel(nombre) {
+    var P = S.proy, h = [], equipos = P.paneles.concat(P.fuentes), filasN = [];
+    equipos.forEach(function (eq) {
+      var ref = (porId(P.paneles, eq.id) ? 'p:' : 'f:') + eq.id;
+      (eq.filas || []).forEach(function (f, i) { if (f.zona === nombre) filasN.push({ eq: eq, ref: ref, f: f, i: i }); });
+    });
+    h.push('<div class="encabezado"><div><h2>' + esc(nombre) + ' <span class="sec-sub">sin panel ni transponder</span></h2>' +
+      '<div class="sub">Los dispositivos de este nivel se asignan a lazos como en cualquier otro nivel: elija el equipo (panel, transponder o fuente) del que salen y su lazo. El nivel aparece en el diagrama unifilar con sus dispositivos.</div></div>' +
+      '<div class="acciones"><button class="btn" data-act="ir" data-tab="proyecto">← Proyecto</button>' +
+      '<button class="btn" data-act="nivel-trp" data-nivel="' + esc(nombre) + '" title="Crea un transponder en este nivel y deja de ser un nivel sin panel">Crear transponder aquí</button></div></div>');
+    h.push('<section class="card"><div class="card-h"><h3>Dispositivos conectados en ' + esc(nombre) + '</h3>' +
+      '<span class="nota">Flujo: 1) Equipo → 2) Fabricante y modelo → 3) Lazo → 4) Cantidad. Los lazos disponibles son los del equipo elegido (defínalos en la pestaña de ese equipo o con «＋ Nuevo lazo…»).</span></div>' +
+      '<div class="card-b flush tabla-wrap"><table class="t"><thead><tr><th class="idx">#</th><th>Equipo</th><th>Fabricante</th><th>Modelo / descripción</th><th>TAG</th><th>Nivel</th><th>Lazo / salida</th>' +
+      '<th class="num">Cant.</th><th class="num">I espera unit. (mA)</th><th class="num">I espera total (A)</th><th class="num">I alarma unit. (mA)</th><th class="num">I alarma total (A)</th><th>Observación</th><th></th><th></th></tr></thead><tbody>');
+    filasN.forEach(function (x, n) {
+      var opts = equipos.map(function (e) { return '<option value="' + esc(e.id) + '"' + (e.id === x.eq.id ? ' selected' : '') + '>' + esc(e.tag + (e.nivel ? ' · ' + e.nivel : '')) + '</option>'; }).join('');
+      var tr = filaHTML(x.ref, x.f, n, true).replace('</td>', '</td><td><select class="in w-md" data-nv="eq" data-id="' + esc(x.f.id) + '" title="Equipo del que sale este dispositivo">' + opts + '</select></td>');
+      h.push(tr);
+    });
+    if (!filasN.length) h.push('<tr><td colspan="15" class="vacio">Todavía no hay dispositivos en este nivel. Elija el equipo y use «+ Fila en este nivel».</td></tr>');
+    h.push('</tbody><tfoot><tr><td colspan="9" style="text-align:right">TOTALES del nivel:</td><td class="num" data-out="tot-ie"></td><td></td><td class="num" data-out="tot-ia"></td><td colspan="3"></td></tr></tfoot></table></div>' +
+      '<div class="card-b" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; border-top:1px solid var(--line)">' +
+      '<label class="campo" style="margin:0"><span>Agregar a</span><select id="selNivelEq" class="in">' +
+      equipos.map(function (e) { return '<option value="' + esc(e.id) + '">' + esc(e.tag + (e.nivel ? ' · ' + e.nivel : '')) + '</option>'; }).join('') + '</select></label>' +
+      '<button class="btn primary btn-sm" data-act="nivel-fila" data-nivel="' + esc(nombre) + '" data-n="1">+ Fila en este nivel</button>' +
+      '<button class="btn btn-sm" data-act="nivel-fila" data-nivel="' + esc(nombre) + '" data-n="5">+ 5 filas</button>' +
+      '<button class="btn btn-sm" data-act="copiar-nivel-n" data-nivel="' + esc(nombre) + '" title="Copia los dispositivos de un nivel típico a este, alimentados desde un equipo de otro nivel">⧉ Copiar de otro nivel</button></div></section>');
+    vista.innerHTML = h.join('');
+    S.pintor = function () {
+      var iE = 0, iA = 0, calc = {};
+      equipos.forEach(function (eq) { calc[eq.id] = porId(P.fuentes, eq.id) ? Calc.fuente(S.cx, eq, P) : Calc.panel(S.cx, eq, P); });
+      filasN.forEach(function (x) {
+        var r = calc[x.eq.id].filas[x.i], f = x.f;
+        if (!r) return;
+        out('tag:' + f.id, esc(r.tag)); out('desc:' + f.id, esc(r.descripcion));
+        out('ie:' + f.id, r.iEspT === null ? '' : fmt(r.iEspT, 4)); out('ia:' + f.id, r.iAlmT === null ? '' : fmt(r.iAlmT, 4));
+        out('av:' + f.id, r.aviso ? '<span class="aviso ' + r.nivel + '" title="' + esc(r.aviso) + '">' + (r.nivel === 'error' ? '❌ ' : (r.nivel === 'info' ? 'ℹ ' : '⚠ ')) + esc(r.aviso) + '</span>' : '');
+        iE += r.iEspT || 0; iA += r.iAlmT || 0;
+        var tr = vista.querySelector('tr[data-fila="' + f.id + '"]');
+        if (tr) {
+          tr.classList.toggle('aviso-error', r.nivel === 'error');
+          tr.querySelectorAll('[data-k="iEsp"],[data-k="iAlm"]').forEach(function (inp) { inp.classList.toggle('editado', inp.value.trim() !== ''); });
+        }
+      });
+      out('tot-ie', fmt(iE, 4)); out('tot-ia', fmt(iA, 4));
+    };
+  }
+
+  function vistaCaida() {
+    var P = S.proy, cd = P.caida, pp = P.params;
+    var Bp = function (k, t) { return { o: 'params', k: k, t: t }; };
+    var h = [];
+    h.push('<div class="encabezado"><div><h2>Caída de tensión en lazos</h2><div class="sub">SLC / NAC / IDNAC / 24 VDC — método de carga concentrada al final del lazo (conservador, NFPA 72 Anexo A).</div></div>' +
+      '<div class="acciones"><button class="btn" data-act="ir" data-tab="memoria">Ver memoria de cálculo →</button></div></div>');
+    h.push('<div class="grid-2col"><section class="card"><div class="card-h"><h3>Parámetros globales</h3><span class="nota">Compartidos con la pestaña Proyecto</span></div><div class="card-b"><div class="grid c2">' +
+      campo('Tensión nominal (V)', Bp('vNominal', 'num'), pp.vNominal) +
+      campo('Fuente a fin de vida de batería (%)', Bp('pctFinVida', 'pct'), pp.pctFinVida, { ayuda: '<span data-out="vfuente"></span> — criterio UL 864' }) +
+      campo('Tensión mínima de dispositivo (V)', Bp('vMin', 'num'), pp.vMin, { ayuda: 'Regulados UL 1971/464: típico 16–33 V' }) +
+      campo('I máx. por circuito NAC (A)', Bp('iMaxNac', 'num'), pp.iMaxNac, { ayuda: 'Ej.: NAC de 3 A × 80 % = 2.4 A' }) +
+      '</div></div></section>' +
+      '<div class="ayuda"><b>Cómo se calcula:</b> los lazos se definen en la pestaña de cada panel («Lazos y salidas»); cada dispositivo se asigna a su lazo y a su nivel.<br>' +
+      'I<sub>lazo</sub> = Σ(cantidad × mA de alarma de los dispositivos asignados) + OTROS. R<sub>lazo</sub> = 2 × L × R(Ω/km)/1000. ' +
+      'V<sub>disp</sub> = V<sub>fuente</sub> − I × R<sub>lazo</sub>. Aceptación: V<sub>disp</sub> ≥ V<sub>mín</sub> e I ≤ I máx. NAC.<br>' +
+      'Use <b>OTROS (mA)</b> solo para cargas que no están en la lista de dispositivos.</div></div>');
+
+    h.push('<section class="card"><div class="card-h"><h3>Lazos y salidas</h3><span class="nota">Todos los lazos del proyecto; el equipo del que salen se elige en «Fuente / panel»</span></div>' +
+      '<div class="card-b flush tabla-wrap"><table class="t"><thead><tr><th class="idx">#</th><th>Fuente / panel</th><th>Lazo</th><th>Tipo</th><th>Clase</th><th>Nivel</th><th>Alimentado por</th><th>Descripción</th>' +
+      '<th class="num">Disp.</th><th class="num">Otros (mA)</th><th class="num">I lazo (mA)</th><th>Cable</th><th class="num">R (Ω/km)</th><th class="num">Long. ida (m)</th><th class="num">R lazo (Ω)</th>' +
+      '<th class="num">Caída (V)</th><th class="num">V disp. (V)</th><th class="num">% caída</th><th>Estado</th><th>Comentario</th><th></th></tr></thead><tbody>');
+    cd.circuitos.forEach(function (c, i) {
+      var b = function (k, t) { return 'data-o="circ" data-id="' + esc(c.id) + '" data-k="' + k + '"' + (t ? ' data-t="' + t + '" type="number" step="any"' : ''); };
+      h.push('<tr><td class="idx">' + (i + 1) + '</td>' +
+        '<td><select class="in w-sm" ' + b('fuente') + '>' + optsEquipos(c.fuente) + '</select></td>' +
+        '<td><input class="in w-sm" ' + b('circuito') + ' value="' + esc(c.circuito) + '" placeholder="Ej.: SLC 1"></td>' +
+        '<td><select class="in w-sm" ' + b('tipo') + '>' + optsTiposLazo(c.tipo) + '</select></td>' +
+        celdaClase(c) +
+        '<td><select class="in w-md" ' + b('nivel') + '>' + optsNiveles(c.nivel) + '</select></td>' +
+        celdaAlim(c) +
+        '<td><input class="in w-md" ' + b('desc') + ' value="' + esc(c.desc) + '" placeholder="Ej.: Detección torre A"></td>' +
+        '<td class="calc num" data-out="n:' + c.id + '"></td>' +
+        '<td><input class="in w-xs" min="0" ' + b('otros', 'num') + ' value="' + fmtN(c.otros) + '" placeholder="mA"></td>' +
+        '<td class="calc num" data-out="i:' + c.id + '"></td>' +
+        '<td><select class="in w-md" ' + b('cable') + '>' + optsCables(c.cable) + '</select></td>' +
+        '<td class="calc num" data-out="r:' + c.id + '"></td>' +
+        '<td><input class="in w-xs" min="0" ' + b('long', 'num') + ' value="' + fmtN(c.long) + '" placeholder="150"></td>' +
+        '<td class="calc num" data-out="rl:' + c.id + '"></td><td class="calc num" data-out="dv:' + c.id + '"></td>' +
+        '<td class="calc num" data-out="vd:' + c.id + '"></td><td class="calc num" data-out="pc:' + c.id + '"></td>' +
+        '<td data-out="es:' + c.id + '"></td><td class="desc" data-out="co:' + c.id + '"></td>' +
+        '<td style="white-space:nowrap"><button class="btn-icon" title="Duplicar" data-act="circ-dup" data-id="' + esc(c.id) + '">⧉</button>' +
+        '<button class="btn-icon del" title="Eliminar" data-act="circ-del" data-id="' + esc(c.id) + '">✕</button></td></tr>');
+    });
+    if (!cd.circuitos.length) h.push('<tr><td colspan="21" class="vacio">Sin lazos. Agréguelos aquí o en la pestaña de cada panel («Lazos y salidas»).</td></tr>');
+    h.push('</tbody><tfoot><tr><td colspan="8" style="text-align:right">TOTAL (A):</td><td class="num" data-out="tot"></td><td colspan="10" class="muted" style="font-weight:400">Verificar contra la capacidad total del panel / fuente</td></tr></tfoot></table></div>' +
+      '<div class="card-b" style="display:flex; gap:8px; border-top:1px solid var(--border)"><button class="btn primary btn-sm" data-act="circ-add" data-n="1">+ Lazo</button></div></section>');
+    vista.innerHTML = h.join('');
+
+    S.pintor = function () {
+      var R = Calc.caida(S.cx, P);
+      out('vfuente', '= ' + fmt(R.params.vFuente, 2) + ' V');
+      cd.circuitos.forEach(function (c, i) {
+        var r = R.circuitos[i];
+        out('n:' + c.id, r.n ? fmt(r.n, 0) : '—');
+        out('i:' + c.id, r.iMa === null ? '' : fmt(r.iMa, 1));
+        out('r:' + c.id, r.rKm === null ? '' : fmt(r.rKm, 2));
+        out('rl:' + c.id, r.rLazo === null ? '' : fmt(r.rLazo, 3));
+        out('dv:' + c.id, r.caida === null ? '' : fmt(r.caida, 2));
+        out('vd:' + c.id, r.vDisp === null ? '' : fmt(r.vDisp, 2));
+        out('pc:' + c.id, r.pct === null ? '' : fmt(r.pct * 100, 1) + ' %');
+        out('es:' + c.id, r.estado ? badge(r.estado) : '');
+        out('co:' + c.id, esc(r.comentario));
+      });
+      out('tot', fmt(R.totalA, 3));
+      renderTabs();
+    };
+  }
+
+  /* ======================= vista: Memoria de cálculo (formato Sinergia) =======================
+   * Hoja carta, membrete y pie en las cajas de margen del @page (ver css/styles.css). Tablas con título «Tabla No. N»,
+   * solo reglas horizontales, anchos de columna declarados, cifras a la derecha y ninguna celda en blanco («—»).
+   * El color queda solo para la criticidad (la palabra, sin píldora ni fondo). */
+  function crit(est) {
+    if (!est) return '—';
+    if (est === 'OK') return 'OK';
+    return '<span class="' + (est === 'INCOMPLETO' ? 'crit-warn' : 'crit-err') + '">' + esc(est) + '</span>';
+  }
+  function dato(x) { return x === null || x === undefined || x === '' ? '—' : esc(x); }
+
+  /* cols: [{t: encabezado, w: ancho relativo, num: true si es cifra}] · filas: [celdas] o {tot: true, c: celdas}.
+   * Una celda es texto HTML o {h: html, s: colspan}. Una celda vacía se imprime como «—». */
+  function tablaDoc(ctx, titulo, cols, filas, vacio) {
+    ctx.n++;
+    var cap = '<figcaption><span>Tabla No. ' + ctx.n + '</span><br>' + esc(titulo) + '</figcaption>';
+    if (!filas.length) return '<figure class="doc-table">' + cap + '<p class="note">' + esc(vacio || 'Sin datos') + '</p></figure>';
+    var suma = cols.reduce(function (s, c) { return s + c.w; }, 0);
+    var cg = '<colgroup>' + cols.map(function (c) { return '<col style="width:' + (c.w / suma * 100).toFixed(2) + '%">'; }).join('') + '</colgroup>';
+    var th = '<thead><tr>' + cols.map(function (c) { return '<th' + (c.num ? ' class="num"' : '') + '>' + esc(c.t) + '</th>'; }).join('') + '</tr></thead>';
+    var tb = '<tbody>' + filas.map(function (f) {
+      var celdas = f.c || f, col = 0;
+      return '<tr' + (f.tot ? ' class="total"' : '') + '>' + celdas.map(function (c) {
+        var span = c && typeof c === 'object' ? (c.s || 1) : 1, html = c && typeof c === 'object' ? c.h : c;
+        var num = cols[col] && cols[col].num && span === 1;
+        col += span;
+        return '<td' + (num ? ' class="num"' : '') + (span > 1 ? ' colspan="' + span + '"' : '') + '>' + (html === '' || html === null || html === undefined ? '—' : html) + '</td>';
+      }).join('') + '</tr>';
+    }).join('') + '</tbody>';
+    return '<figure class="doc-table">' + cap + '<div class="tabla-wrap"><table>' + cg + th + tb + '</table></div></figure>';
+  }
+
+  /* ======================= Memoria de cálculo =======================
+     Formato (SkillFormato) y redacción (SkillRedaccion) de Sinergia. Un solo cálculo de datos
+     (memoriaDatos) alimenta el PDF (MemoriaSinergia) y el Excel (ExcelSinergia). La pantalla muestra
+     el mismo documento en una vista previa: lo que se ve es lo que se imprime. */
+  function memoriaDatos() {
+    var MS = window.MemoriaSinergia, num = MS.num, MARCA = MS.MARCA;
+    var P = S.proy, pp = P.params, R = Calc.proyecto(S.cx, P), vF = R.caida.params.vFuente;
+    var detalle = S.memDetalle !== false;
+    var I = function (h, cm) { return { h: h, a: 'izq', cm: cm }; };
+    var N = function (h, cm, d) { return { h: h, a: 'der', cm: cm, d: d }; };
+    var equipos = R.paneles.map(function (x) { return x.p.tag; }).concat(R.fuentes.map(function (x) { return x.f.tag; }));
+    var estadoPal = function (e) { return !e ? MARCA : (e === 'OK' ? 'Cumple' : (e.indexOf('ERROR') === 0 || e === 'REVISAR' ? 'Crítico' : 'Observación')); };
+    var colorEstado = function (v) { return v === 'Crítico' ? 'FFA8281E' : v === 'Observación' ? 'FF8A5A0B' : 'FF000000'; };
+    var EST = function (cm) { return { h: 'Estado', a: 'izq', cm: cm, color: colorEstado }; };
+    var maxBat = S.cat.baterias.reduce(function (m, b) { return Math.max(m, Calc.num(b.ah) || 0); }, 0);
+
+    var datos = [['Número', P.numero], ['Cliente', P.cliente], ['Ubicación', P.ubicacion], ['Elaborado por', P.elaboro], ['Revisado por', P.reviso],
+                 ['Empresa', P.empresa], ['Fecha de emisión', P.fecha ? MS.fechaTxt(new Date(P.fecha + 'T12:00:00')) : ''], ['Versión', P.revision || '0'], ['Normativa', P.normativa], ['Equipos', equipos.join(', ')]];
+
+    var alcance = 'Este documento presenta la memoria de cálculo del sistema de detección y alarma contra incendio del Proyecto ' + P.nombre +
+      (P.numero ? ', número ' + P.numero : '') + (P.ubicacion ? ', ubicado en ' + P.ubicacion : '') + ', con base en NFPA 72:2022, UL 864 y NEC Art. 760. ' +
+      'Comprende las baterías secundarias de paneles, transponders y fuentes auxiliares, y la caída de tensión de los lazos. ' +
+      'Además, proporciona la base para la continuación del proceso de diseño. La documentación definitiva será elaborada por el especialista de cada sistema que constituye el proyecto ejecutivo.';
+    var criterios = [
+      'NFPA 72:2022 §10.6.7.2.1(1): la fuente secundaria debe operar el sistema 24 horas en espera y luego 5 minutos en alarma.',
+      'NFPA 72:2022 §10.6.7.2.1(2): en sistemas de voceo y EVACS, 24 horas en espera y 15 minutos a carga máxima conectada.',
+      'Parámetros de este proyecto: espera de ' + num(pp.tEspera, 0) + ' h, alarma de ' + num(pp.tAlarma, 0) + ' min y factor de seguridad de ' + num(pp.fs * 100, 0) + ' %, salvo reemplazo indicado en el equipo.',
+      'El factor de seguridad sobre la capacidad calculada responde al requisito de las fichas de fabricante (Simplex, Notifier y Siemens) por envejecimiento de las baterías.',
+      'Todo dispositivo de notificación debe operar dentro de su rango listado (UL 1971 y UL 464, típico de 16 a 33 V regulado). El cálculo usa la tensión de fuente degradada a fin de vida de la batería: ' +
+        num(vF, 2) + ' V (' + num(pp.pctFinVida * 100, 0) + ' % de ' + num(pp.vNominal, 0) + ' V, criterio UL 864).',
+      'El cableado y la supervisión se diseñan según NFPA 72, Cap. 12, y NEC Art. 760 (FPL, FPLR y FPLP).'
+    ];
+    var metodo = [
+      'Ah de espera = I espera (A) × t espera (h); Ah de alarma = I alarma (A) × t alarma (h). Ah requerido = (Ah de espera + Ah de alarma) × (1 + FS).',
+      'Las corrientes unitarias se toman del catálogo de dispositivos (fichas de fabricante) y deberán verificarse contra la revisión vigente del modelo, la candela y el tap de planos.',
+      'La batería se selecciona automáticamente con la capacidad estándar inmediata superior del catálogo (2 × 12 V en serie = 24 VDC). Cada panel o transponder calcula su propia batería: las baterías del transponder respaldan solo su carga local.',
+      'En caída de tensión se usa carga concentrada: R del lazo = 2 × L × r, con L la longitud de ida (m) y r la resistencia por conductor (Ω/m) de la ficha del fabricante; V del dispositivo = V de fuente − I del circuito × R del lazo, con V de fuente = ' + num(vF, 2) + ' V.',
+      'Se acepta el circuito si V del dispositivo ≥ ' + num(pp.vMin, 1) + ' V e I del circuito ≤ ' + num(pp.iMaxNac, 2) + ' A (80 % de la corriente máxima del NAC o de la fuente). La carga concentrada es el método más conservador aceptado por NFPA 72 (Anexo A).'
+    ];
+
+    var revisar = R.paneles.filter(function (x) { return x.r.estado !== 'OK'; }).length + R.fuentes.filter(function (x) { return x.r.estado !== 'OK'; }).length;
+    var errCaida = R.caida.errores;
+    var resumenTxt = 'El sistema comprende ' + R.paneles.length + (R.paneles.length === 1 ? ' panel o transponder' : ' paneles y transponders') + ' y ' + R.fuentes.length +
+      (R.fuentes.length === 1 ? ' fuente auxiliar' : ' fuentes auxiliares') + ', con un requerimiento total de ' + num(R.totalPaneles.ahReq, 2) + ' Ah. ' +
+      (revisar ? revisar + (revisar === 1 ? ' equipo requiere' : ' equipos requieren') + ' revisión' : 'Todos los equipos cumplen') + ' y ' +
+      (errCaida ? errCaida + (errCaida === 1 ? ' circuito presenta' : ' circuitos presentan') + ' error de caída de tensión.' : 'ningún circuito presenta error de caída de tensión.');
+
+    var tResumen = {
+      titulo: 'Resumen de resultados del sistema',
+      cols: [I('Indicador', 11.1), N('Valor', 4.4, 2)],
+      filas: [['Ah requerido total de paneles y transponders (Ah)', R.totalPaneles.ahReq], ['Paneles y transponders (u)', R.paneles.length], ['Fuentes auxiliares (u)', R.fuentes.length],
+              ['Equipos por revisar (u)', revisar], ['Circuitos con error de caída de tensión (u)', errCaida]]
+    };
+    var sBat = 0; R.paneles.forEach(function (x) { sBat += x.r.bat.ah || 0; });
+    var tBat = {
+      titulo: 'Capacidad de baterías por panel y transponder',
+      cols: [I('TAG', 1.9), I('Ubicación', 2.4), N('I espera (A)', 1.7, 3), N('I alarma (A)', 1.7, 3), N('Ah requerido', 1.8, 2), N('Batería (Ah)', 1.5, 1), I('Referencia', 2.8), EST(1.8)],
+      filas: R.paneles.map(function (x) {
+        var b = x.r.bat;
+        return [x.p.tag, x.p.nivel, b.iEsp, b.iAlm, b.ahReq, b.ah, b.referencia, estadoPal(x.r.estado)];
+      }),
+      total: [2, 3, 4, 5], totalEtiqueta: 'Total del sistema',
+      nota: (R.paneles.filter(function (x) { var q = x.p; return Calc.num(q.tEspera) !== null || Calc.num(q.tAlarma) !== null || Calc.num(q.fs) !== null; }).map(function (x) {
+        var b = x.r.bat;
+        return x.p.tag + ' (espera ' + num(b.tEsp, 0) + ' h, alarma ' + num(b.tAlmMin, 0) + ' min, FS ' + num(b.fs * 100, 0) + ' %)';
+      }).join('; ')) ? 'Parámetros propios del equipo: ' + R.paneles.filter(function (x) { var q = x.p; return Calc.num(q.tEspera) !== null || Calc.num(q.tAlarma) !== null || Calc.num(q.fs) !== null; }).map(function (x) {
+        var b = x.r.bat;
+        return x.p.tag + ' (espera ' + num(b.tEsp, 0) + ' h, alarma ' + num(b.tAlmMin, 0) + ' min, FS ' + num(b.fs * 100, 0) + ' %)';
+      }).join('; ') + '.' : ''
+    };
+    var verFuente = function (x) { return x.r.okCorriente === null ? 'Sin I máx.' : (x.r.okCorriente ? 'Cumple' : 'Excede'); };
+    var tFuentes = {
+      titulo: 'Fuentes de poder auxiliares: corrientes y verificación del 80 %',
+      cols: [I('TAG', 1.9), I('Ubicación', 2.2), I('Alimentada desde', 2.6), N('I espera (A)', 1.7, 3), N('I alarma (A)', 1.7, 3), N('I máx. (A)', 1.5, 2), N('80 % I máx. (A)', 1.9, 2),
+             { h: 'Verificación', a: 'izq', cm: 2.1, color: function (v) { return v === 'Excede' ? 'FFA8281E' : 'FF000000'; } }],
+      filas: R.fuentes.map(function (x) {
+        return [x.f.tag, x.f.nivel, nombreEquipo(x.f.panelId), x.r.iEsp, x.r.iAlm, Calc.num(x.f.iMax), x.r.iPermitida, verFuente(x)];
+      })
+    };
+    var tFuenteBat = {
+      titulo: 'Fuentes de poder auxiliares: baterías',
+      cols: [I('TAG', 2.4), N('Ah requerido', 2.6, 2), N('Batería (Ah)', 2.4, 1), I('Referencia', 5.8), EST(2.4)],
+      filas: R.fuentes.map(function (x) { var b = x.r.bat; return [x.f.tag, b.ahReq, b.ah, b.referencia, estadoPal(x.r.estado)]; })
+    };
+
+    // Anexos (hoja apaisada): caída de tensión por lazo, resumen de dispositivos y detalle de cargas
+    var cds = P.caida.circuitos;
+    var tCaida = {
+      titulo: 'Caída de tensión por lazo (carga concentrada)',
+      cols: [I('Fuente / lazo', 3.0), I('Nivel / descripción', 3.6), N('Disp. (u)', 1.3, 0), N('I (mA)', 1.3, 0), I('Cable', 3.0), N('L (m)', 1.3, 0), N('R lazo (Ω)', 1.6, 2), N('Caída (V)', 1.6, 2), N('V disp. (V)', 1.6, 2), N('Caída (%)', 1.5, 1), EST(2.1)],
+      filas: cds.map(function (c, i) {
+        var r = R.caida.circuitos[i], cab = S.cx.cables[c.cable];
+        return [nombreEquipo(c.fuente) + ' ' + (c.circuito || ''), [c.nivel, c.desc].filter(Boolean).join(' — '), r.n || null, r.iMa, cab ? cab.modelo + ' ' + cab.awg + ' AWG' : '',
+                Calc.num(c.long), r.rLazo !== undefined ? r.rLazo : null, r.caida, r.vDisp, r.pct === null ? null : r.pct * 100, estadoPal(r.estado)];
+      })
+    };
+    var RD = R.dispositivos, matriz = RD.columnas.length <= 8;
+    var anchoEq = 1.2, fijo = 2.2 + 2.6 + 1.3, descW = matriz ? Math.max(4, 21.9 - fijo - RD.columnas.length * anchoEq) : 21.9 - fijo;
+    var colsD = [I('Circuito', 2.2), I('Código', 2.6), I('Descripción', descW)]
+      .concat(matriz ? RD.columnas.map(function (c) { return N(c.tag, anchoEq, 0); }) : []).concat([N('Total (u)', 1.3, 0)]);
+    var tDisp = {
+      titulo: 'Resumen de dispositivos' + (matriz ? ' por equipo' : ''), cols: colsD,
+      filas: RD.filas.map(function (f) { return [f.disp.circuito, f.disp.modelo, f.disp.descripcion].concat(matriz ? f.cant.map(function (n) { return n || null; }) : []).concat([f.total]); })
+    };
+    var tDetalle = [];
+    if (detalle) {
+      R.paneles.map(function (x) { return { e: x.p, r: x.r, f: false }; }).concat(R.fuentes.map(function (x) { return { e: x.f, r: x.r, f: true }; })).forEach(function (x) {
+        var filas = [];
+        x.e.filas.forEach(function (f, i) {
+          var fr = x.r.filas[i], d = S.cx.disp[f.disp];
+          if (!f.disp && Calc.num(f.cant) === null) return;
+          filas.push([d ? (d.modelo && d.modelo !== '—' ? d.modelo : d.tag) : '', fr.descripcion, f.zona, Calc.num(f.cant), fr.iEspU, fr.iEspT, fr.iAlmU, fr.iAlmT]);
+        });
+        if (!filas.length) return;
+        var b = x.r.bat;
+        tDetalle.push({
+          titulo: 'Detalle de cargas de ' + x.e.tag + (x.e.nivel ? ' · ' + x.e.nivel : '') + (x.f ? ' (fuente auxiliar)' : ''),
+          procedencia: 'Ah = ' + num(b.iEsp, 4) + ' A × ' + num(b.tEsp, 0) + ' h + ' + num(b.iAlm, 4) + ' A × ' + num(b.tAlmMin, 0) + '/60 h = ' + num(b.ahCalc, 3) + ' Ah; × (1 + ' + num(b.fs * 100, 0) + ' %) = ' + num(b.ahReq, 3) +
+            ' Ah, con batería de ' + (b.ah !== null ? num(b.ah, 1) + ' Ah (' + b.referencia + ')' : 'capacidad que excede el catálogo'),
+          cols: [I('Código', 2.8), I('Descripción', 5.7), I('Nivel / zona', 3.2), N('Cant. (u)', 1.4, 0), N('I esp. unit. (mA)', 2.2, 2), N('I esp. total (A)', 2.2, 4), N('I alm. unit. (mA)', 2.2, 2), N('I alm. total (A)', 2.2, 4)],
+          filas: filas, totalEtiqueta: 'Totales', total: [], totalExtra: { 5: x.r.iEsp, 7: x.r.iAlm },
+          nota: x.f ? 'Los totales incluyen el consumo propio de la fuente (' + num(Calc.num(x.e.iPropia) || 0, 3) + ' A).' : ''
+        });
+      });
+    }
+
+    // Observaciones: una entrada por elemento, con hecho · contraste · consecuencia · acción
+    var hallazgos = [];
+    var H = function (codigo, critico, hecho, contraste, consecuencia, accion) {
+      hallazgos.push({ codigo: codigo, criticidad: critico ? 'Crítico' : 'Observación', texto: hecho + ' ' + contraste + ' Por lo tanto, ' + consecuencia + ' ' + accion });
+    };
+    var DIS = 'El diseñador deberá ';
+    R.paneles.forEach(function (x) {
+      var b = x.r.bat, t = x.p.tag;
+      if (b.excede) H(t, true, 'La capacidad requerida de ' + t + ' es de ' + num(b.ahReq, 1) + ' Ah.', 'La mayor batería del catálogo es de ' + num(maxBat, 1) + ' Ah.', 'no existe una batería estándar que cubra la carga del equipo.',
+        DIS + 'dividir la carga entre más equipos o definir una fuente de mayor capacidad antes de la emisión para construcción.');
+      if (x.r.errores) H(t, true, t + ' tiene ' + x.r.errores + (x.r.errores === 1 ? ' fila' : ' filas') + ' de dispositivos con error.', 'Cada fila debe indicar un dispositivo del catálogo y una cantidad válida.',
+        'la carga del equipo puede estar subestimada.', DIS + 'completar o corregir esas filas y verificar nuevamente el cálculo.');
+      if (b.bateria && b.bateria.obs) H(t, false, 'Para ' + t + ' se seleccionó una batería de ' + num(b.ah, 1) + ' Ah.', 'La ficha del catálogo indica: ' + b.bateria.obs + '.',
+        'la referencia de la batería requiere confirmación.', DIS + 'confirmar la referencia con el fabricante antes de la emisión para construcción.');
+    });
+    R.fuentes.forEach(function (x) {
+      var b = x.r.bat, t = x.f.tag;
+      if (x.r.okCorriente === false) H(t, true, 'La corriente de alarma de ' + t + ' es de ' + num(x.r.iAlm, 3) + ' A.', 'El máximo permitido es de ' + num(x.r.iPermitida, 2) + ' A (80 % de la capacidad de la fuente).',
+        'la fuente queda sobrecargada en alarma.', DIS + 'redistribuir la carga o seleccionar una fuente de mayor capacidad.');
+      if (b.excede) H(t, true, 'La capacidad requerida de ' + t + ' es de ' + num(b.ahReq, 1) + ' Ah.', 'La mayor batería del catálogo es de ' + num(maxBat, 1) + ' Ah.', 'no existe una batería estándar que cubra la carga de la fuente.',
+        DIS + 'dividir la carga o definir una fuente de mayor capacidad antes de la emisión para construcción.');
+      if (x.r.errores) H(t, true, t + ' tiene ' + x.r.errores + (x.r.errores === 1 ? ' fila' : ' filas') + ' de dispositivos con error.', 'Cada fila debe indicar un dispositivo del catálogo y una cantidad válida.',
+        'la carga de la fuente puede estar subestimada.', DIS + 'completar o corregir esas filas y verificar nuevamente el cálculo.');
+    });
+    R.caida.circuitos.forEach(function (r, i) {
+      var c = cds[i];
+      if (!r.estado || r.estado === 'OK') return;
+      var critico = r.estado.indexOf('ERROR') === 0;
+      var cod = (nombreEquipo(c.fuente) + ' ' + (c.circuito || '#' + (i + 1))).trim();
+      H(cod, critico, 'El lazo ' + cod + ' presenta una caída de tensión de ' + num(r.caida, 2) + ' V' + (r.pct === null || r.pct === undefined ? '' : ' (' + num(r.pct * 100, 1) + ' %)') + ' con ' + num(r.vDisp, 2) + ' V en el último dispositivo.',
+        'La verificación resulta en: ' + r.estado.replace(/^ERROR:\s*/, '').toLowerCase() + (r.comentario ? ', ' + r.comentario.toLowerCase() : '') + '.',
+        'los dispositivos del final del lazo pueden quedar fuera de su rango de operación.', DIS + 'aumentar el calibre, acortar o dividir el lazo, y verificar nuevamente antes de la emisión para construcción.');
+    });
+
+    return {
+      P: P, datos: datos, alcance: alcance, criterios: criterios, metodo: metodo, resumenTxt: resumenTxt, hallazgos: hallazgos,
+      tResumen: tResumen, tBat: tBat, tFuentes: tFuentes, tFuenteBat: tFuenteBat, tCaida: tCaida, tDisp: tDisp, tDetalle: tDetalle, nFuentes: R.fuentes.length, nPaneles: R.paneles.length,
+      cierre: 'Los valores de corriente de dispositivos y de resistencia de cables provienen de fichas técnicas y deberán verificarse contra la revisión vigente antes de construcción. Los valores indicados constituyen una base de partida; su ajuste final deberá ser analizado y confirmado por el diseñador responsable, bajo las condiciones reales de la instalación. La aprobación final corresponde a la autoridad competente (AHJ, Ingeniería de Bomberos de Costa Rica). Catálogo actualizado: ' + (S.cat.actualizado || MARCA) + '.'
+    };
+  }
+
+  function memoriaDoc() {
+    var MS = window.MemoriaSinergia, num = MS.num, MARCA = MS.MARCA;
+    var D = memoriaDatos(), P = D.P;
+    var celda = function (v, col) { return typeof v === 'number' ? num(v, col.d || 0) : (v === null || v === undefined || v === '' ? MARCA : String(v)); };
+    var totalFila = function (T) {
+      if (!T.total || !T.filas.length) return null;
+      return T.cols.map(function (col, i) {
+        if (i === 0) return T.totalEtiqueta || 'Total';
+        if (T.total.indexOf(i) >= 0) return num(T.filas.reduce(function (s, f) { return s + (typeof f[i] === 'number' ? f[i] : 0); }, 0), col.d || 0);
+        return T.totalExtra && T.totalExtra[i] !== undefined && T.totalExtra[i] !== null ? num(T.totalExtra[i], col.d || 0) : MARCA;
+      });
+    };
+    var TB = function (T, extra) {
+      return M.tabla(Object.assign({
+        titulo: T.titulo, procedencia: T.procedencia, nota: T.nota,
+        anchos: T.cols.map(function (x) { return x.cm; }), cabeceras: T.cols.map(function (x) { return x.h; }), alin: T.cols.map(function (x) { return x.a; }),
+        filas: T.filas.map(function (f) { return f.map(function (v, i) { return celda(v, T.cols[i]); }); }), total: totalFila(T)
+      }, extra || {}));
+    };
+    var M = MS.nuevo({ docNombre: 'Memoria de alarmas · ' + (P.numero || ''), titulo: 'Memoria de cálculo del sistema de detección y alarma contra incendio', subtitulo: P.nombre, datos: D.datos });
+
+    M.h2('Alcance').p(D.alcance);
+    M.h2('Criterios normativos').p('Los criterios aplicados en la memoria son los siguientes:').lista(D.criterios);
+    M.h2('Metodología de cálculo').p('El cálculo se realiza de la siguiente manera:').lista(D.metodo);
+    M.h2('Resultados').p(D.resumenTxt + ' El resumen de resultados se presenta a continuación:');
+    TB(D.tResumen);
+    M.p('La capacidad de baterías por panel y transponder se presenta a continuación:');
+    if (D.tBat.filas.length) TB(D.tBat); else M.p('El proyecto no tiene paneles o transponders.');
+    if (D.nFuentes) {
+      M.p('Las fuentes de poder auxiliares se presentan a continuación:');
+      TB(D.tFuentes); TB(D.tFuenteBat);
+    }
+    if (D.hallazgos.length) {
+      M.h2('Observaciones').p('Durante la verificación se identificaron observaciones sobre ' + D.hallazgos.length + (D.hallazgos.length === 1 ? ' elemento' : ' elementos') + ':');
+      D.hallazgos.forEach(function (h) { M.hallazgo(h); });
+    } else {
+      M.h2('Observaciones').p('No se identificaron observaciones: todos los equipos y circuitos cumplen con los criterios.');
+    }
+    M.h2('Consideraciones finales').p(D.cierre);
+
+    var primero = true;
+    [D.tCaida, D.tDisp].concat(D.tDetalle).forEach(function (T) {
+      if (!T.filas.length) return;
+      TB(T, { apaisada: true, encabezado: primero ? 'Anexos' : '' }); primero = false;
+    });
+    return M;
+  }
+
+  function imprimirMemoria() {
+    var P = S.proy;
+    return window.MemoriaSinergia.imprimir(memoriaDoc().html(), window.MemoriaSinergia.nombreArchivo(['memoria_alarmas', P.numero, P.nombre], 'pdf'))
+      .catch(function (e) { console.error(e); toast('No se pudo preparar la impresión'); });
+  }
+
+  /* Excel con formato Sinergia (excel-sinergia.js): mismas tablas que el PDF, con totales como fórmulas */
+  function excelMemoria() {
+    var ES = window.ExcelSinergia, MS = window.MemoriaSinergia;
+    var D = memoriaDatos(), P = D.P;
+    var perfil = (window.Acceso && Acceso.perfil && Acceso.perfil()) || {};
+    toast('Generando Excel…');
+    return ES.libro({ autor: perfil.nombre_completo || perfil.correo || '', docNombre: 'Memoria de alarmas · ' + (P.numero || ''), titulo: 'Memoria de cálculo del sistema de detección y alarma contra incendio' }).then(function (wb) {
+      var r = wb.hoja('Resumen', { anchos: [34, 22, 14, 14, 14, 14, 26, 16] });
+      r.titulo('Memoria de cálculo del sistema de detección y alarma contra incendio');
+      r.dato('Proyecto', P.nombre, true);
+      D.datos.forEach(function (d) { r.dato(d[0], d[1], d[0] === 'Número'); });
+      r.espacio().parrafo(D.resumenTxt).espacio();
+      r.tabla(D.tResumen);
+      if (D.tBat.filas.length) r.tabla(D.tBat);
+      if (D.nFuentes) { r.tabla(D.tFuentes); r.tabla(D.tFuenteBat); }
+      r.nota('Nota: ' + MS.MARCA + ' indica que el dato aplica pero no se ha definido. Los valores indicados constituyen una base de partida; su ajuste final deberá ser analizado y confirmado por el diseñador responsable.');
+      r.pagina();
+
+      var det = function (nombre, T, anchos) {
+        if (!T.filas.length) return;
+        var h = wb.hoja(nombre, { apaisada: true, repetirEncabezado: true, anchos: anchos });
+        h.tabla(T); h.pagina();
+      };
+      det('Caída de tensión', D.tCaida, [24, 34, 9, 9, 24, 9, 11, 11, 11, 10, 14]);
+      var anchosD = [14, 18, 50].concat(D.tDisp.cols.slice(3).map(function () { return 10; }));
+      det('Dispositivos', D.tDisp, anchosD);
+      if (D.tDetalle.length) {
+        var dc = wb.hoja('Detalle de cargas', { apaisada: true, anchos: [20, 44, 22, 10, 16, 16, 16, 16] });
+        D.tDetalle.forEach(function (T) { dc.tabla(T); });
+        dc.pagina();
+      }
+      if (D.hallazgos.length) {
+        var o = wb.hoja('Observaciones', { apaisada: true, repetirEncabezado: true, anchos: [26, 14, 120] });
+        o.tabla({
+          titulo: 'Observaciones de la verificación',
+          cols: [{ h: 'Elemento', a: 'izq' }, { h: 'Criticidad', a: 'izq', color: wb.colorCriticidad }, { h: 'Descripción', a: 'izq' }],
+          filas: D.hallazgos.map(function (h) { return [h.codigo, h.criticidad, h.texto]; })
+        });
+        o.pagina();
+      }
+      var k = wb.hoja('Criterios', { anchos: [110] });
+      k.titulo('Criterios normativos');
+      D.criterios.forEach(function (x) { k.parrafo(x); });
+      k.espacio().h2('Metodología de cálculo');
+      D.metodo.forEach(function (x) { k.parrafo(x); });
+      k.espacio().h2('Consideraciones finales').parrafo(D.cierre);
+      k.pagina();
+      return wb.descargar(MS.nombreArchivo(['memoria_alarmas', P.numero, P.nombre], 'xlsx'));
+    }).then(function () { toast('Excel descargado'); }).catch(function (e) { console.error(e); toast('No se pudo generar el Excel: ' + (e.message || e)); });
+  }
+
+  function vistaMemoria() {
+    var detalle = S.memDetalle !== false;
+    vista.innerHTML =
+      '<div class="card no-print" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; padding:14px 16px">' +
+      '<button class="btn primary" data-act="imprimir">Imprimir / Guardar PDF</button>' +
+      '<button class="btn" data-act="xlsx">Descargar Excel (.xlsx)</button>' +
+      '<label style="display:flex; align-items:center; gap:6px; font-size:13px"><input type="checkbox" id="chkDetalle"' + (detalle ? ' checked' : '') + '> Incluir el detalle de cargas por equipo (anexo)</label>' +
+      '<span class="muted" style="font-size:12px">Vista previa del documento. El membrete y el pie aparecen al imprimir.</span></div>' +
+      '<iframe id="memoPreview" class="memo-preview" title="Vista previa de la memoria de cálculo"></iframe>';
+    var f = document.getElementById('memoPreview');
+    f.srcdoc = memoriaDoc().html();
+    f.addEventListener('load', function () { try { f.style.height = (f.contentDocument.documentElement.scrollHeight + 24) + 'px'; } catch (e) { /* mismo origen */ } });
+  }
+
+  /* ======================= vista: Administración ======================= */
+  var COLS_ADMIN = {
+    dispositivos: [
+      { k: 'fabricante', l: 'Fabricante', tipo: 'fab' }, { k: 'modelo', l: 'Modelo / ref.', w: 'w-sm' }, { k: 'tag', l: 'TAG', w: 'w-sm' },
+      { k: 'tipo', l: 'Tipo (qué es)', w: 'w-md', list: 'dl-tipos' },
+      { k: 'descripcion', l: 'Descripción', w: 'w-lg' }, { k: 'iEspera', l: 'I espera (mA)', t: 'num' }, { k: 'iAlarma', l: 'I alarma (mA)', t: 'num' },
+      { k: 'circuito', l: 'Circuito', w: 'w-sm', list: 'dl-circuitos' }, { k: 'circuito2', l: '2.º circuito (24VDC, VOCEO…)', w: 'w-sm', list: 'dl-circuitos2' }, { k: 'obs', l: 'Fuente / observación', w: 'w-lg' }
+    ],
+    cables: [
+      { k: 'fabricante', l: 'Fabricante', w: 'w-sm' }, { k: 'modelo', l: 'Modelo', w: 'w-sm' }, { k: 'awg', l: 'AWG', t: 'num' }, { k: 'conductores', l: 'Cond.', t: 'num' },
+      { k: 'pantalla', l: 'Pantalla', w: 'w-xs' }, { k: 'listado', l: 'Listado NEC/UL', w: 'w-sm' }, { k: 'rKm', l: 'R (Ω/km /cond.)', t: 'num' },
+      { k: '_rm', l: 'R (Ω/m)', calc: function (x) { return fmt(Calc.num(x.rKm) / 1000, 5); } },
+      { k: 'uso', l: 'Uso típico', w: 'w-md' }, { k: 'obs', l: 'Observación', w: 'w-lg' }
+    ],
+    baterias: [
+      { k: 'ah', l: 'Capacidad (Ah)', t: 'num' }, { k: 'refSimplex', l: 'Ref. Simplex', w: 'w-sm' }, { k: 'refNotifier', l: 'Ref. Notifier / PS', w: 'w-md' },
+      { k: 'refGenerica', l: 'Ref. genérica', w: 'w-sm' }, { k: 'obs', l: 'Observación', w: 'w-lg' }
+    ],
+    fabricantes: [{ k: 'nombre', l: 'Nombre del fabricante / marca', w: 'w-lg', re: 'all' }]
+  };
+  var SUBS = [
+    { id: 'dispositivos', l: 'Dispositivos' }, { id: 'cables', l: 'Cables' }, { id: 'baterias', l: 'Baterías' },
+    { id: 'fabricantes', l: 'Fabricantes / marcas' }
+  ].concat([{ id: 'respaldo', l: 'Respaldo' }]);
+
+
+  /* ======================= vista: Láminas DXF (DU · matriz · cálculos) ======================= */
+  var LAMINAS = [
+    { id: 'du', t: 'Diagrama unifilar (DU)', f: 'DU alarmas' },
+    { id: 'matriz', t: 'Matriz de entradas / salidas', f: 'Matriz alarmas' },
+    { id: 'calc', t: 'Cálculos (baterías, fuentes, caídas)', f: 'Calculos alarmas' },
+    { id: 'simb', t: 'Simbología', f: 'Simbologia alarmas' }
+  ];
+  function ctxLamina() { return { proy: S.proy, cx: S.cx, Calc: Calc }; }
+  function matrizProy() { return S.proy.matriz || (S.proy.matriz = Lamina.matrizBase()); }
+  function nombreDXF(id) {
+    var l = LAMINAS.filter(function (x) { return x.id === id; })[0];
+    return ((S.proy.numero ? S.proy.numero + ' ' : '') + l.f + ' ' + (S.proy.nombre || '')).trim().replace(/[\\/:*?"<>|]+/g, '_') + '.dxf';
+  }
+  function descargarDXF(id, hojas) {
+    var txt = hojas ? Lamina.dxfHojas(id, ctxLamina()) : Lamina.aDXF(Lamina.lamina(id, ctxLamina()));
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([txt], { type: 'application/dxf' }));
+    a.download = hojas ? nombreDXF(id).replace(/\.dxf$/, ' - laminas 1100x750.dxf') : nombreDXF(id);
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  }
+  /* Vista previa con zoom (rueda y botones), manita para desplazar (arrastrar) y «ajustar» (doble clic) */
+  function pintarLamina() {
+    var el = document.getElementById('laminaVista');
+    if (!el) return;
+    var d = Lamina.lamina(S.lam, ctxLamina());
+    el.innerHTML = Lamina.aSVG(d);
+    var svg = el.querySelector('svg');
+    svg.removeAttribute('style');
+    svg.style.cssText = 'width:100%;height:100%;display:block;background:#fff;touch-action:none;user-select:none;cursor:grab';
+    var full = { x: 0, y: 0, w: d.w, h: d.h }, ant = S.lamView;
+    var v = ant && ant.id === S.lam && ant.full.w === full.w && ant.full.h === full.h ? ant.v : { x: 0, y: 0, w: d.w, h: d.h };
+    S.lamView = { id: S.lam, full: full, v: v };
+    function ver() { svg.setAttribute('viewBox', v.x + ' ' + v.y + ' ' + v.w + ' ' + v.h); var z = document.getElementById('lamZoomTxt'); if (z) z.textContent = Math.round(Math.max(full.w / v.w, full.h / v.h) * 100) + ' %'; }
+    function aPunto(cx, cy) { var pt = svg.createSVGPoint(); pt.x = cx; pt.y = cy; var m = svg.getScreenCTM(); return m ? pt.matrixTransform(m.inverse()) : { x: v.x + v.w / 2, y: v.y + v.h / 2 }; }
+    function zoom(f, p) {
+      var nw = Math.min(Math.max(v.w / f, full.w / 60), full.w * 4), k = nw / v.w;
+      p = p || { x: v.x + v.w / 2, y: v.y + v.h / 2 };
+      v.x = p.x - (p.x - v.x) * k; v.y = p.y - (p.y - v.y) * k; v.h = v.h * k; v.w = nw; ver();
+    }
+    function ajustar() { v.x = 0; v.y = 0; v.w = full.w; v.h = full.h; ver(); }
+    S.lamZoom = zoom; S.lamAjustar = ajustar;
+    ver();
+    svg.addEventListener('wheel', function (e) { e.preventDefault(); zoom(e.deltaY < 0 ? 1.18 : 1 / 1.18, aPunto(e.clientX, e.clientY)); }, { passive: false });
+    var arr = null, mov = null, armado = null;      // armado: texto habilitado para moverse (tras «Mover» en el menú del clic derecho)
+    function desarmar() { if (armado) { armado.el.setAttribute('stroke', 'none'); armado.el.removeAttribute('stroke-width'); armado.el.style.cursor = 'context-menu'; armado = null; } }
+    svg.addEventListener('pointerdown', function (e) {
+      if (e.button === 2) return;
+      var tx = e.target.closest && e.target.closest('[data-mid]');
+      // los textos están bloqueados: solo el que se armó con «Mover» se puede arrastrar; el resto se comporta como el fondo (manita)
+      if (tx && armado && armado.el === tx) { mov = { id: tx.getAttribute('data-mid'), el: tx, x0: e.clientX, y0: e.clientY, dx: 0, dy: 0 }; svg.setPointerCapture(e.pointerId); return; }
+      if (armado) desarmar();
+      arr = { x: e.clientX, y: e.clientY }; svg.setPointerCapture(e.pointerId); svg.style.cursor = 'grabbing';
+    });
+    // clic derecho sobre un texto: menú Mover / Restablecer
+    svg.addEventListener('contextmenu', function (e) {
+      var tx = e.target.closest && e.target.closest('[data-mid]');
+      if (!tx) return;
+      e.preventDefault();
+      var id = tx.getAttribute('data-mid'), movido = !!(S.proy.duMov && S.proy.duMov[id]);
+      var mn = document.getElementById('menuTexto');
+      if (!mn) { mn = document.createElement('div'); mn.id = 'menuTexto'; mn.className = 'combo-lista'; document.body.appendChild(mn); }
+      mn.innerHTML = '<div class="combo-mas" style="padding:4px 8px"><b>' + esc(String(tx.textContent).slice(0, 38)) + '</b></div>' +
+        '<button type="button" class="combo-it" data-mt="mover">✥ Mover este texto</button>' +
+        (movido ? '<button type="button" class="combo-it" data-mt="reset">↺ Volver a su posición</button>' : '') +
+        '<button type="button" class="combo-it" data-mt="cancelar">Cancelar</button>';
+      mn.style.cssText = 'display:block;min-width:220px;left:' + Math.min(e.clientX, window.innerWidth - 240) + 'px;top:' + Math.min(e.clientY, window.innerHeight - 140) + 'px';
+      function cerrar() { mn.style.display = 'none'; document.removeEventListener('mousedown', fuera, true); }
+      function fuera(ev) { if (!mn.contains(ev.target)) cerrar(); }
+      mn.onclick = function (ev) {
+        var b = ev.target.closest('[data-mt]'); if (!b) return;
+        var a = b.getAttribute('data-mt'); cerrar();
+        if (a === 'mover') { desarmar(); armado = { id: id, el: tx }; tx.setAttribute('stroke', '#e91e63'); tx.setAttribute('stroke-width', '0.25'); tx.style.cursor = 'move'; toast('Arrastre el texto a su nueva posición (Esc cancela)'); }
+        else if (a === 'reset') { delete S.proy.duMov[id]; proyectoCambiado(); pintarLamina(); }
+      };
+      setTimeout(function () { document.addEventListener('mousedown', fuera, true); }, 0);
+    });
+    if (S.escMov) document.removeEventListener('keydown', S.escMov);
+    S.escMov = function (e) { if (e.key === 'Escape') desarmar(); };
+    document.addEventListener('keydown', S.escMov);
+    svg.addEventListener('pointermove', function (e) {
+      if (mov) {
+        var rm = svg.getBoundingClientRect(), em = Math.max(v.w / rm.width, v.h / rm.height);
+        mov.dx = (e.clientX - mov.x0) * em; mov.dy = (e.clientY - mov.y0) * em;
+        mov.el.setAttribute('transform', 'translate(' + mov.dx.toFixed(2) + ' ' + mov.dy.toFixed(2) + ')');
+        return;
+      }
+      if (!arr) return;
+      var r = svg.getBoundingClientRect(), esc = Math.max(v.w / r.width, v.h / r.height);
+      v.x -= (e.clientX - arr.x) * esc; v.y -= (e.clientY - arr.y) * esc; arr = { x: e.clientX, y: e.clientY }; ver();
+    });
+    function soltar() {
+      arr = null; svg.style.cursor = 'grab';
+      if (mov) {
+        var m = mov; mov = null; desarmar();      // al soltar, el texto vuelve a quedar bloqueado
+        if (Math.abs(m.dx) + Math.abs(m.dy) > 0.2) {
+          var MV = S.proy.duMov || (S.proy.duMov = {}), o = MV[m.id] || [0, 0];
+          MV[m.id] = [o[0] + m.dx, o[1] - m.dy];      // en el dibujo Y crece hacia arriba
+          proyectoCambiado(); pintarLamina();
+        }
+      }
+    }
+    svg.addEventListener('pointerup', soltar); svg.addEventListener('pointercancel', soltar);
+    svg.addEventListener('dblclick', ajustar);
+  }
+  /* Notas del diagrama: cada una se puede apagar con su casilla y editar */
+  function notasDUProy() { var n = S.proy.notasDU; if (!n || !n.facp || !n.gen) n = S.proy.notasDU = Lamina.notasDUBase(); if (!n.cab) n.cab = Lamina.notasDUBase().cab; return n; }
+  function editorNotasDU() {
+    var N = notasDUProy(), letra = 0;
+    function lista(g, titulo, ayuda) {
+      var h = '<h3 style="margin:.9rem 0 .2rem">' + titulo + '</h3><p class="muted" style="margin:0 0 .5rem">' + ayuda + '</p>';
+      N[g].forEach(function (x) {
+        var item = x.grupo === 'i', cab = x.grupo === 'h';
+        h += '<div style="display:flex;gap:.5rem;align-items:flex-start;margin:.3rem 0' + (item ? ';margin-left:2rem' : '') + '">' +
+          '<input type="checkbox" title="Mostrar esta nota en el diagrama" data-nu="on" data-g="' + g + '" data-id="' + esc(x.id) + '"' + (x.on ? ' checked' : '') + ' style="margin-top:.6rem">' +
+          '<textarea rows="' + (x.txt.length > 150 ? 4 : (x.txt.length > 70 ? 2 : 1)) + '" data-nu="txt" data-g="' + g + '" data-id="' + esc(x.id) + '" style="flex:1;' + (x.on ? '' : 'opacity:.5') + '">' + esc(x.txt) + '</textarea>' +
+          '<button class="btn btn-sm" data-act="nu-del" data-g="' + g + '" data-id="' + esc(x.id) + '" title="Quitar la nota">✕</button></div>';
+      });
+      return h + '<div class="acciones"><button class="btn btn-sm" data-act="nu-add" data-g="' + g + '">＋ Nota</button>' + (g === 'facp' ? '<button class="btn btn-sm" data-act="nu-add" data-g="facp" data-item="1">＋ Botón de desconexión</button>' : '') + '</div>';
+    }
+    return '<div class="card"><h2>Notas del diagrama</h2>' +
+      '<p class="muted">Marque o desmarque la casilla para mostrar u ocultar cada nota en el diagrama (no se borra); edite el texto a su gusto. ' +
+      'En el texto, <code>{tEspera}</code>, <code>{tAlarma}</code> y <code>{facpRef}</code> se reemplazan por los parámetros del proyecto y el modelo del panel. Los botones de desconexión se rotulan A, B, C… en orden según los que estén marcados.</p>' +
+      lista('facp', 'Notas junto al FACP (con flecha al panel)', 'Se dibujan a la izquierda del panel, como en la lámina ED-6200.') +
+      lista('cab', 'Especificación de cableado (tabla «Cableado sistema alarmas contra incendio»)', 'En el texto, {SLC}, {IDC}, {NAC}, {VOCEO} y {24VDC} se reemplazan por el cable elegido en los lazos de ese tipo; una línea nueva separa las referencias.') +
+      lista('gen', 'Notas generales (tabla «Notas sistema alarmas contra incendio»)', 'Se numeran en orden según las que estén marcadas.') +
+      '<div class="acciones" style="margin-top:.8rem"><button class="btn" data-act="nu-base">Restablecer notas base</button></div></div>';
+  }
+  /* Simbología CDCLH-001S: por fila, mostrar siempre / automático (si el proyecto la usa) / ocultar; descripción y referencia editables */
+  function simbProy() { return S.proy.simbDU || (S.proy.simbDU = {}); }
+  function editorSimbologia() {
+    var ov = simbProy(), ctx = ctxLamina();
+    var h = '<div class="card"><h2>Simbología (CDCLH-001S)</h2>' +
+      '<p class="muted">Las descripciones y referencias salen de la simbología de alarmas contra incendio CDCLH-001S (versiones Simplex y Notifier) y se completan con los modelos ya cargados en el catálogo. ' +
+      '«Automático» muestra la fila solo si el proyecto usa un dispositivo de ese tipo; «Siempre» la muestra aunque no se use; «Nunca» la oculta. La referencia vacía se calcula sola.</p>' +
+      '<div style="overflow:auto;max-height:70vh"><table class="tabla"><thead><tr><th>Símbolo</th><th>Mostrar</th><th style="min-width:26rem">Descripción</th><th style="min-width:18rem">Referencia (vacío = automática)</th></tr></thead><tbody>';
+    Simbologia.filas.forEach(function (r) {
+      var o = ov[r.id] || {}, usa = Lamina.usaFila(r.id, ctx), modo = o.modo || 'auto';
+      h += '<tr><td><b>' + esc(r.nombre) + '</b><br><small class="muted">' + (usa ? 'usado en el proyecto' : 'no usado') + ' · ' + esc(r.sim) + '</small></td>' +
+        '<td><select data-sb="modo" data-id="' + esc(r.id) + '"><option value="auto"' + (modo === 'auto' ? ' selected' : '') + '>Automático</option><option value="on"' + (modo === 'on' ? ' selected' : '') + '>Siempre</option><option value="off"' + (modo === 'off' ? ' selected' : '') + '>Nunca</option></select></td>' +
+        '<td><textarea rows="3" data-sb="desc" data-id="' + esc(r.id) + '" style="width:100%">' + esc(o.desc || r.desc) + '</textarea></td>' +
+        '<td><textarea rows="3" data-sb="ref" data-id="' + esc(r.id) + '" placeholder="' + esc(Lamina.refAuto(r.id, ctx)) + '" style="width:100%">' + esc(o.ref || '') + '</textarea></td></tr>';
+    });
+    return h + '</tbody></table></div><div class="acciones" style="margin-top:.8rem"><button class="btn" data-act="sb-base">Restablecer simbología</button></div></div>';
+  }
+  function editorMatriz() {
+    var M = matrizProy();
+    var h = '<div class="card"><h2>Matriz de entradas / salidas</h2>' +
+      '<p class="muted">Marque con las casillas qué señal de entrada (columnas) activa cada función de salida (filas). Fuente: ' + esc(M.fuente || 'importada') + '.</p>' +
+      '<div class="acciones" style="margin-bottom:.6rem">' +
+      '<button class="btn" data-act="mat-importar">⬆ Importar estándar (PDF, Excel, Word)</button>' +
+      '<button class="btn" data-act="mat-fila">＋ Función de salida</button>' +
+      '<button class="btn" data-act="mat-col">＋ Señal de entrada</button>' +
+      '<button class="btn" data-act="mat-base">Restablecer matriz base</button></div>' +
+      '<div style="overflow:auto;max-height:70vh"><table class="tabla matriz"><thead><tr><th style="min-width:20rem">Acción / salida</th><th>Nota</th>';
+    M.entradas.forEach(function (e) {
+      h += '<th class="mcol"><input data-lm="en" data-id="' + esc(e.id) + '" value="' + esc(e.nombre) + '" title="' + esc(e.nombre) + '" style="width:7rem">' +
+        '<button class="btn btn-sm" data-act="mat-col-del" data-id="' + esc(e.id) + '" title="Quitar columna">✕</button></th>';
+    });
+    h += '<th></th></tr></thead><tbody>';
+    M.salidas.forEach(function (s) {
+      h += '<tr><td><textarea rows="2" data-lm="st" data-id="' + esc(s.id) + '" style="width:100%">' + esc(s.texto) + '</textarea></td>' +
+        '<td><input data-lm="sn" data-id="' + esc(s.id) + '" value="' + esc(s.nota || '') + '" style="width:3.5rem"></td>';
+      M.entradas.forEach(function (e) {
+        var m = (s.marcas || {})[e.id];
+        h += '<td style="text-align:center"><input type="checkbox" data-lm="mk" data-s="' + esc(s.id) + '" data-id="' + esc(e.id) + '"' + (m ? ' checked' : '') + '>' +
+          (m && m !== 'X' ? '<br><small>' + esc(m) + '</small>' : '') + '</td>';
+      });
+      h += '<td><button class="btn btn-sm" data-act="mat-fila-del" data-id="' + esc(s.id) + '" title="Quitar fila">✕</button></td></tr>';
+    });
+    h += '</tbody></table></div>' +
+      '<label class="campo" style="margin-top:.8rem"><span>Notas generales (una por línea)</span><textarea rows="4" data-lm="gen">' + esc((M.generales || []).join('\n')) + '</textarea></label>' +
+      '<label class="campo"><span>Notas / anotaciones numeradas (una por línea)</span><textarea rows="8" data-lm="notas">' + esc((M.notas || []).join('\n')) + '</textarea></label></div>';
+    return h;
+  }
+  function vistaLaminas() {
+    if (!S.lam) S.lam = 'du';
+    var h = '<div class="card"><h2>Diagrama unifilar, matriz y cálculos</h2>' +
+      '<p class="muted">Cada lámina se genera con los datos del proyecto (niveles, paneles, dispositivos, lazos, baterías y caídas de tensión) y se descarga como <b>DXF</b> con capas <code>FA-*</code> ' +
+      '(ábralo en AutoCAD y guárdelo como DWG, o péguelo con <code>COPYCLIP</code> en su lámina). Símbolos: NFPA 170 (2018) cap. 8.</p>' +
+      '<div class="acciones">' + LAMINAS.map(function (l) {
+        return '<button class="btn' + (S.lam === l.id ? ' primario' : '') + '" data-act="lam-sel" data-id="' + l.id + '">' + esc(l.t) + '</button>';
+      }).join('') +
+      '<span style="flex:1"></span><button class="btn primario" data-act="lam-dxf">⬇ Descargar DXF de esta lámina</button>' +
+      '<button class="btn" data-act="lam-dxf-todas">⬇ Todas las láminas</button></div>' +
+      '<div class="acciones" style="margin-top:.5rem"><span class="muted">Láminas con cajetín Sinergia 1100 × 750 mm:</span>' +
+      '<button class="btn" data-act="lam-dxf-hojas">⬇ DXF en láminas con cajetín</button>' +
+      '<button class="btn" data-act="lam-pdf-hojas">🖨 PDF en láminas con cajetín</button></div></div>';
+    if (S.lam === 'matriz') h += editorMatriz();
+    h += '<div class="card"><div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-bottom:.5rem"><h2 style="margin:0;flex:1">Vista previa</h2>' +
+      '<span class="muted" style="font-size:.85em">Rueda = zoom · arrastre = mover (✋) · doble clic = ajustar · clic derecho sobre un texto = «Mover»</span>' +
+      '<button class="btn btn-sm" data-act="mov-reset" title="Devuelve los textos movidos a su posición original">Restablecer textos</button>' +
+      '<button class="btn btn-sm" data-act="z-out" title="Alejar">−</button><span id="lamZoomTxt" style="min-width:3.2rem;text-align:center">100 %</span>' +
+      '<button class="btn btn-sm" data-act="z-in" title="Acercar">＋</button><button class="btn btn-sm" data-act="z-fit" title="Ajustar a la ventana">Ajustar</button></div>' +
+      '<div id="laminaVista" style="height:72vh;overflow:hidden;background:#fff;border:1px solid var(--line,#ccc);border-radius:6px;cursor:grab"></div></div>';
+    if (S.lam === 'du') h += editorNotasDU();   // las notas se editan debajo del diagrama
+    if (S.lam === 'du' || S.lam === 'simb') h += editorSimbologia();
+    vista.innerHTML = h;
+    S.pintor = pintarLamina;
+  }
+  vista.addEventListener('change', function (e) {
+    var en = e.target;
+    if (en.dataset && en.dataset.nv === 'eq') {
+      var de = equipoDeFila(en.dataset.id), a = porId(S.proy.paneles, en.value) || porId(S.proy.fuentes, en.value), fl = de && porId(de.filas, en.dataset.id);
+      if (de && a && fl && de !== a) {
+        de.filas = de.filas.filter(function (x) { return x !== fl; });
+        fl.circ = ''; fl.circ2 = '';      // los lazos son del equipo anterior: se vuelve a elegir
+        a.filas.push(fl);
+        proyectoCambiado(); renderVista(); toast('Dispositivo pasado a ' + a.tag + ': elija su lazo');
+      }
+      return;
+    }
+    if (en.dataset && en.dataset.sb) {
+      var SB = simbProy(), fila = Simbologia.porId(en.dataset.id), o = SB[en.dataset.id] || (SB[en.dataset.id] = {});
+      if (en.dataset.sb === 'modo') { o.modo = en.value; if (o.modo === 'auto') delete o.modo; }
+      else if (en.dataset.sb === 'desc') { if (en.value.trim() === fila.desc.trim() || !en.value.trim()) delete o.desc; else o.desc = en.value; }
+      else if (en.dataset.sb === 'ref') { if (en.value.trim()) o.ref = en.value; else delete o.ref; }
+      if (!Object.keys(o).length) delete SB[en.dataset.id];
+      proyectoCambiado(); pintarLamina(); return;
+    }
+    if (en.dataset && en.dataset.nu) {
+      var NU = notasDUProy(), q = porId(NU[en.dataset.g], en.dataset.id);
+      if (q) { if (en.dataset.nu === 'on') { q.on = en.checked; var ta = en.parentNode.querySelector('textarea'); if (ta) ta.style.opacity = q.on ? '' : '.5'; } else q.txt = en.value; }
+      proyectoCambiado(); pintarLamina(); return;
+    }
+    var el = e.target, t = el.dataset && el.dataset.lm;
+    if (!t) return;
+    var M = matrizProy();
+    function sal(id) { return M.salidas.filter(function (x) { return x.id === id; })[0]; }
+    if (t === 'en') { var en = M.entradas.filter(function (x) { return x.id === el.dataset.id; })[0]; if (en) en.nombre = el.value; }
+    else if (t === 'st') { var s1 = sal(el.dataset.id); if (s1) s1.texto = el.value; }
+    else if (t === 'sn') { var s2 = sal(el.dataset.id); if (s2) s2.nota = el.value; }
+    else if (t === 'mk') { var s3 = sal(el.dataset.s); if (s3) { s3.marcas = s3.marcas || {}; if (el.checked) s3.marcas[el.dataset.id] = 'X'; else delete s3.marcas[el.dataset.id]; } }
+    else if (t === 'gen') M.generales = el.value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean);
+    else if (t === 'notas') M.notas = el.value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean);
+    if (!/editada/.test(M.fuente || '')) M.fuente = (M.fuente || 'Matriz') + ' · editada';
+    proyectoCambiado(); pintarLamina();
+  });
+
+  function vistaAdmin() {
+    var h = [];
+    h.push('<div class="encabezado"><div><h2>Administración de catálogos</h2><div class="sub">Equivale a las hojas ocultas BD_DISPOSITIVOS, BD_CABLES y BD_BATERIAS del Excel. Los cambios aplican a todos los proyectos.</div></div></div>');
+    h.push('<div class="alerta-admin">Modo administrador. Toda corriente y resistencia debe <b>verificarse contra la ficha vigente</b> del fabricante. ' +
+      (REMOTO ? 'El catálogo se guarda en Supabase y lo comparten todos los usuarios.'
+        : 'En esta fase el catálogo se guarda en este navegador; use «Respaldo» para exportarlo y compartirlo.') + '</div>');
+    if (S.cat.sinSemilla) {
+      h.push('<div class="alerta-admin" style="background:var(--err-bg); border-color:#f2b8b8; color:var(--err)"><b>La base de datos no tiene catálogo.</b> ' +
+        'Se está mostrando el catálogo del Excel. <button class="btn btn-sm primary" data-act="cat-semilla">Cargar catálogo base a Supabase</button></div>');
+    }
+    h.push('<div class="subtabs">' + SUBS.map(function (s) {
+      var n = S.cat[s.id] ? ' (' + S.cat[s.id].length + ')' : '';
+      return '<button class="subtab' + (S.adminSub === s.id ? ' activa' : '') + '" data-act="admin-sub" data-sub="' + s.id + '">' + s.l + n + '</button>';
+    }).join('') + '</div>');
+
+    var sub = S.adminSub;
+    if (sub === 'respaldo') {
+      h.push('<section class="card"><div class="card-h"><h3>Respaldo del catálogo</h3><span class="nota">Actualizado: ' + esc(S.cat.actualizado || '—') + '</span></div><div class="card-b" style="display:flex; gap:8px; flex-wrap:wrap">' +
+        '<button class="btn" data-act="cat-exportar">Exportar catálogo (.json)</button>' +
+        '<button class="btn" data-act="cat-importar">Importar catálogo (.json)</button>' +
+        '<button class="btn danger" data-act="cat-restablecer">Restablecer catálogo base (Excel)</button></div></section>' +
+        (REMOTO ? '' : '<section class="card"><div class="card-h"><h3>PIN de administrador</h3></div><div class="card-b"><p style="margin-top:0; color:var(--ink-2)">El PIN solo protege la interfaz en este navegador. Con Supabase configurado se reemplaza por usuarios con rol «admin» y políticas RLS.</p>' +
+        '<button class="btn" data-act="pin-cambiar">Cambiar PIN</button></div></section>'));
+      vista.innerHTML = h.join('');
+      return;
+    }
+    var cols = COLS_ADMIN[sub];
+    var lista = S.cat[sub];
+    if (sub === 'baterias') lista.sort(function (a, b) { return (Calc.num(a.ah) || 0) - (Calc.num(b.ah) || 0); });
+    h.push('<section class="card"><div class="card-h">');
+    if (sub === 'dispositivos') {
+      h.push('<div style="display:flex; gap:8px; flex-wrap:wrap"><select class="in" id="fFab" style="width:auto"><option value="">Todos los fabricantes</option>' +
+        S.cat.fabricantes.map(function (f) { return '<option value="' + esc(f.id) + '"' + (S.adminFiltro.fab === f.id ? ' selected' : '') + '>' + esc(f.nombre) + '</option>'; }).join('') + '</select>' +
+        '<input class="in" id="fQ" placeholder="Buscar modelo, TAG o descripción…" style="width:260px" value="' + esc(S.adminFiltro.q) + '"></div>');
+    } else {
+      h.push('<h3>' + esc(SUBS.filter(function (s) { return s.id === sub; })[0].l) + '</h3>');
+    }
+    if (sub === 'baterias') h.push('<span class="nota">Se ordenan de menor a mayor: la selección toma la capacidad inmediata superior</span>');
+    h.push('<button class="btn primary btn-sm" data-act="cat-add">+ Agregar</button></div><div class="card-b flush tabla-wrap"><table class="t"><thead><tr>' +
+      cols.map(function (c) { return '<th' + (c.t ? ' class="num"' : '') + '>' + esc(c.l) + '</th>'; }).join('') + (sub === 'fabricantes' ? '<th class="num">Dispositivos</th>' : '') + '<th></th></tr></thead><tbody>');
+    lista.forEach(function (x) {
+      h.push('<tr data-row="' + esc(x.id) + '" data-fab="' + esc(x.fabricante || '') + '">');
+      cols.forEach(function (c) {
+        if (c.calc) { h.push('<td class="calc num" data-out="calc:' + x.id + ':' + c.k + '">' + c.calc(x) + '</td>'); return; }
+        var a = 'data-o="cat" data-col="' + sub + '" data-id="' + esc(x.id) + '" data-k="' + c.k + '"' + (c.re ? ' data-re="' + c.re + '"' : '');
+        if (c.tipo === 'fab') h.push('<td><select class="in w-sm" ' + a + '>' + optsFabricantes(x.fabricante) + '</select></td>');
+        else if (c.t) h.push('<td><input class="in w-xs" type="number" step="any" data-t="num" ' + a + ' value="' + fmtN(x[c.k]) + '"></td>');
+        else h.push('<td><input class="in ' + (c.w || '') + '" ' + (c.list ? 'list="' + c.list + '" ' : '') + a + ' value="' + esc(x[c.k]) + '"></td>');
+      });
+      if (sub === 'fabricantes') h.push('<td class="calc num">' + Calc.dispositivosDe(S.cx, x.id).length + '</td>');
+      h.push('<td style="white-space:nowrap">' + (sub !== 'fabricantes' ? '<button class="btn-icon" title="Duplicar" data-act="cat-dup" data-id="' + esc(x.id) + '">⧉</button>' : '') +
+        '<button class="btn-icon del" title="Eliminar" data-act="cat-del" data-id="' + esc(x.id) + '">✕</button></td></tr>');
+    });
+    h.push('</tbody></table></div></section>');
+    var circuitos = {};
+    S.cat.dispositivos.forEach(function (d) { if (d.circuito) circuitos[d.circuito] = 1; });
+    var tipos = {};
+    S.cat.dispositivos.forEach(function (d) { if (d.tipo) tipos[d.tipo] = 1; });
+    h.push('<datalist id="dl-tipos">' + Object.keys(tipos).sort().map(function (t) { return '<option value="' + esc(t) + '">'; }).join('') + '</datalist>');
+    h.push('<datalist id="dl-circuitos2"><option value="24VDC"><option value="VOCEO"><option value="NAC"><option value="SLC"></datalist>');
+    h.push('<datalist id="dl-circuitos">' + Object.keys(circuitos).map(function (c) { return '<option value="' + esc(c) + '">'; }).join('') + '</datalist>');
+    vista.innerHTML = h.join('');
+
+    if (sub === 'dispositivos') {
+      S.pintor = filtrarAdmin;
+      var fFab = document.getElementById('fFab'), fQ = document.getElementById('fQ');
+      fFab.addEventListener('change', function () { S.adminFiltro.fab = fFab.value; filtrarAdmin(); });
+      fQ.addEventListener('input', function () { S.adminFiltro.q = fQ.value; filtrarAdmin(); });
+    } else if (sub === 'cables') {
+      S.pintor = function () {
+        S.cat.cables.forEach(function (x) { out('calc:' + x.id + ':_rm', COLS_ADMIN.cables[7].calc(x)); });
+      };
+    }
+  }
+
+  function filtrarAdmin() {
+    var fab = S.adminFiltro.fab, q = S.adminFiltro.q.toLowerCase().trim();
+    vista.querySelectorAll('tr[data-row]').forEach(function (tr) {
+      var d = porId(S.cat.dispositivos, tr.getAttribute('data-row'));
+      var ok = (!fab || d.fabricante === fab) && (!q || [d.modelo, d.tag, d.descripcion, d.circuito].join(' ').toLowerCase().indexOf(q) >= 0);
+      tr.style.display = ok ? '' : 'none';
+    });
+  }
+
+  /* ======================= enlace de datos ======================= */
+  function objetivo(el) {
+    var d = el.dataset, P = S.proy;
+    switch (d.o) {
+      case 'proy': return P;
+      case 'params': return P.params;
+      case 'caida': return P.caida;
+      case 'panel': return porId(P.paneles, d.id);
+      case 'fuente': return porId(P.fuentes, d.id);
+      case 'fila': { var e = equipo(d.eq); return e ? porId(e.filas, d.id) : null; }
+      case 'circ': return porId(P.caida.circuitos, d.id);
+      case 'cat': return porId(S.cat[d.col], d.id);
+    }
+    return null;
+  }
+  function leerValor(el) {
+    var t = el.dataset.t, v = el.value;
+    if (t === 'num') return v.trim() === '' || !isFinite(Number(v)) ? null : Number(v);
+    if (t === 'pct') return v.trim() === '' || !isFinite(Number(v)) ? null : Number(v) / 100;
+    return v;
+  }
+  function asignar(obj, k, v) {
+    var partes = k.split('.'), o = obj;
+    for (var i = 0; i < partes.length - 1; i++) {
+      if (o[partes[i]] === undefined || o[partes[i]] === null) o[partes[i]] = /^\d+$/.test(partes[i + 1]) ? [] : {};
+      o = o[partes[i]];
+    }
+    o[partes[partes.length - 1]] = v;
+  }
+  function aplicar(el) {
+    var obj = objetivo(el);
+    if (!obj) return;
+    var k = el.dataset.k, v = leerValor(el);
+    asignar(obj, k, v);
+    if (el.dataset.o === 'fila' && k === 'fab') {
+      var d = S.cx.disp[obj.disp];
+      if (d && d.fabricante !== v) obj.disp = '';
+    }
+    if (el.dataset.o === 'fila' && k === 'disp') { obj.iEsp = null; obj.iAlm = null; obj.t2 = ''; obj.circ2 = ''; }
+    if (el.dataset.o === 'fila' && k === 't2') obj.circ2 = '';
+    if (el.dataset.o === 'cat') catalogoCambiado(el.dataset.col);
+    else proyectoCambiado();
+    if (S.pintor) S.pintor();
+  }
+
+  vista.addEventListener('input', function (e) {
+    var el = e.target;
+    if (!el.dataset || !el.dataset.k || el.tagName === 'SELECT') return;
+    aplicar(el);
+  });
+  vista.addEventListener('change', function (e) {
+    var el = e.target;
+    if (el.id === 'chkDetalle') { S.memDetalle = el.checked; renderVista(); return; }
+    if (!el.dataset || !el.dataset.k) return;
+    if (el.dataset.o === 'fila' && (el.dataset.k === 'circ' || el.dataset.k === 'circ2') && el.value === '__nuevo__') { acciones['lazo-nuevo'](el); return; }
+    if (el.tagName === 'SELECT') {
+      aplicar(el);
+    }
+    var re = el.dataset.re;
+    if (re === 'vista' || re === 'all') renderVista();
+    if (re === 'tabs' || re === 'all') renderTabs();
+    if (re === 'sel') guardarYa();
+  });
+
+  /* ======================= acciones ======================= */
+  function nuevosIdsEquipo(e, prefijo) {
+    var c = clonar(e);
+    c.id = uid(prefijo);
+    c.filas.forEach(function (f) { f.id = uid('r'); f.circ = ''; f.circ2 = ''; });
+    return c;
+  }
+
+  /* Agrega el nivel (si no existe) y, según «tipoPanel» (TRP / FACP / ''), su panel. Devuelve el panel creado o null. */
+  function crearNivel(nombre, tipoPanel) {
+    var P = S.proy;
+    if (P.niveles.indexOf(nombre) < 0) P.niveles.push(nombre);
+    if (!tipoPanel || P.paneles.some(function (x) { return x.nivel === nombre; })) return null;
+    var pn = nuevoPanel(P.paneles.length ? tipoPanel : 'FACP', nombre);
+    P.paneles.push(pn);
+    return pn;
+  }
+
+  /* Sugerencia para el siguiente nivel: NIVEL 1 → NIVEL 2 */
+  function siguienteNivel() {
+    var l = S.proy.niveles, u = l[l.length - 1];
+    if (!u) return 'NIVEL 1';
+    var m = String(u).match(/^(.*?)(\d+)\s*$/);
+    return m ? m[1] + (parseInt(m[2], 10) + 1) : '';
+  }
+
+  var acciones = {
+    ir: function (b) { irA(b.dataset.tab); },
+    imprimir: function () { imprimirMemoria(); },
+    xlsx: function () { excelMemoria(); },
+
+    'nivel-fila': function (b) {
+      var sel = document.getElementById('selNivelEq'), eq = sel && (porId(S.proy.paneles, sel.value) || porId(S.proy.fuentes, sel.value)), n = +b.dataset.n || 1;
+      if (!eq) { toast('Primero cree un panel o transponder'); return; }
+      var ult = eq.filas[eq.filas.length - 1];
+      for (var i = 0; i < n; i++) eq.filas.push(nuevaFila(ult ? ult.fab : S.proy.fabricante, b.dataset.nivel, ''));
+      proyectoCambiado(); renderVista();
+      var cs = vista.querySelectorAll('input[data-combo]');
+      if (cs.length) cs[cs.length - n].focus();
+    },
+    /* Copia los dispositivos de un nivel típico a un nivel (con o sin panel), alimentándolos desde un equipo de otro nivel */
+    'copiar-nivel-n': function (b) {
+      var P = S.proy, destino = b.dataset.nivel, equipos = P.paneles.concat(P.fuentes);
+      function filasDe(n) { var l = []; equipos.forEach(function (e) { (e.filas || []).forEach(function (f) { if (f.zona === n) l.push({ e: e, f: f }); }); }); return l; }
+      var origenes = P.niveles.filter(function (n) { return n !== destino && filasDe(n).some(function (x) { return x.f.disp; }); });
+      if (!origenes.length) { toast('Ningún otro nivel tiene dispositivos para copiar'); return; }
+      dialogo({
+        titulo: 'Copiar a ' + destino,
+        html: '<label class="campo"><span>Nivel típico (origen)</span><select name="origen">' + origenes.map(function (n) { return '<option value="' + esc(n) + '">' + esc(n) + ' — ' + filasDe(n).filter(function (x) { return x.f.disp; }).length + ' filas</option>'; }).join('') + '</select></label>' +
+          '<label class="campo"><span>Alimentar desde</span><select name="equipo"><option value="">El mismo equipo de cada fila del nivel de origen</option>' + equipos.map(function (e) { return '<option value="' + esc(e.id) + '">' + esc(e.tag + (e.nivel ? ' · ' + e.nivel : '')) + '</option>'; }).join('') + '</select></label>' +
+          '<label class="campo"><span>Lazos</span><select name="lazos"><option value="nuevos">Crear lazos nuevos (mismo tipo, clase, cable y longitud)</option><option value="mismos">Usar los lazos que ya tiene el equipo (del mismo tipo)</option></select></label>' +
+          '<label class="campo"><span>Si ' + esc(destino) + ' ya tiene dispositivos</span><select name="modo"><option value="agregar">Agregar a los existentes</option><option value="reemplazar">Reemplazar (se quitan sus filas)</option></select></label>' +
+          '<p class="nota">Las filas quedan ligadas a ' + esc(destino) + '. Los transponders / paneles del nivel de origen no se copian.</p>',
+        ok: 'Copiar'
+      }).then(function (r) {
+        if (!r) return;
+        if (r.modo === 'reemplazar') equipos.forEach(function (e) { e.filas = (e.filas || []).filter(function (f) { return f.zona !== destino; }); });
+        var fijo = r.equipo ? (porId(P.paneles, r.equipo) || porId(P.fuentes, r.equipo)) : null, mapa = {}, nF = 0, nL = 0;
+        function lazoPara(circId, eqDest) {
+          if (!circId) return '';
+          var c0 = porId(P.caida.circuitos, circId); if (!c0) return '';
+          var k = circId + '>' + eqDest.id; if (mapa[k]) return mapa[k];
+          var ex = r.lazos === 'mismos' ? P.caida.circuitos.filter(function (x) { return x.fuente === eqDest.id && x.tipo === c0.tipo; })[0] : null;
+          if (ex) return (mapa[k] = ex.id);
+          var n = clonar(c0); n.id = uid('c'); n.fuente = eqDest.id; n.nivel = destino;
+          if (P.caida.circuitos.some(function (x) { return x.fuente === eqDest.id && x.circuito === n.circuito; })) n.circuito = nuevoCircuito(eqDest.id, c0.tipo).circuito;
+          P.caida.circuitos.push(n); nL++;
+          return (mapa[k] = n.id);
+        }
+        filasDe(r.origen).forEach(function (x) {
+          var d = S.cx.disp[x.f.disp];
+          if (!x.f.disp && Calc.num(x.f.cant) === null) return;
+          if (d && /^(FACP|TRP)$/.test(d.tag)) return;
+          var eqD = fijo || x.e, c = clonar(x.f); c.id = uid('r'); c.zona = destino;
+          c.circ = lazoPara(x.f.circ, eqD); c.circ2 = lazoPara(x.f.circ2, eqD);
+          eqD.filas.push(c); nF++;
+        });
+        proyectoCambiado(); renderVista();
+        toast('Copiados ' + nF + ' dispositivos y ' + nL + ' lazos de ' + r.origen + ' a ' + destino);
+      });
+    },
+    'nivel-trp': function (b) {
+      var pn = crearNivel(b.dataset.nivel, 'TRP');
+      proyectoCambiado();
+      irA(pn ? 'p:' + pn.id : 'proyecto');
+      if (pn) toast('Transponder ' + pn.tag + ' creado en ' + b.dataset.nivel);
+    },
+    'nivel-nuevo': function () {
+      var P = S.proy;
+      dialogo({
+        titulo: 'Agregar nivel',
+        html: '<label class="campo"><span>Nombre del nivel</span><input name="nombre" required value="' + esc(siguienteNivel()) + '" list="dl-sug-niveles"></label>' +
+          '<datalist id="dl-sug-niveles"><option value="SÓTANO 1"><option value="SÓTANO 2"><option value="NIVEL 1"><option value="MEZANINE"><option value="AZOTEA"></datalist>' +
+          '<label class="campo"><span>Panel de este nivel</span><select name="panel"><option value="TRP">Crear transponder (TRP)</option>' +
+          (P.paneles.length ? '' : '<option value="FACP">Crear panel principal (FACP)</option>') +
+          '<option value="">No crear panel</option></select></label>',
+        ok: 'Agregar'
+      }).then(function (r) {
+        if (!r) return;
+        var nombre = r.nombre.trim().toUpperCase();
+        if (!nombre) return;
+        if (P.niveles.indexOf(nombre) >= 0 && P.paneles.some(function (x) { return x.nivel === nombre; })) { toast('Ese nivel ya existe y tiene panel'); return; }
+        var nuevo = crearNivel(nombre, r.panel);
+        proyectoCambiado();
+        if (nuevo) { S.tab = 'p:' + nuevo.id; toast('Nivel ' + nombre + ' agregado con ' + nuevo.tag); } else toast('Nivel ' + nombre + ' agregado');
+        render();
+        window.scrollTo(0, 0);
+      });
+    },
+    'niveles-rango': function () {
+      dialogo({
+        titulo: 'Agregar varios niveles',
+        html: '<label class="campo"><span>Prefijo</span><select name="pre"><option value="NIVEL">NIVEL</option><option value="SÓTANO">SÓTANO</option><option value="PISO">PISO</option></select></label>' +
+          '<div class="grid c2"><label class="campo"><span>Desde</span><input name="a" type="number" value="1" required></label><label class="campo"><span>Hasta</span><input name="b" type="number" value="5" required></label></div>' +
+          '<label class="campo"><span>Panel en cada nivel nuevo</span><select name="panel"><option value="TRP">Crear transponder (TRP)</option><option value="">No crear paneles</option></select></label>' +
+          '<small>Para sótanos el rango se agrega de mayor a menor (p. ej. SÓTANO 3, SÓTANO 2, SÓTANO 1).</small>',
+        ok: 'Agregar'
+      }).then(function (r) {
+        if (!r) return;
+        var a = parseInt(r.a, 10), b = parseInt(r.b, 10), l = [];
+        if (!isFinite(a) || !isFinite(b)) return;
+        var lo = Math.min(a, b), hi = Math.max(a, b);
+        for (var i = lo; i <= hi && l.length < 200; i++) l.push(r.pre + ' ' + i);
+        if (r.pre === 'SÓTANO') l.reverse();
+        var n = 0;
+        l.forEach(function (nv) {
+          if (S.proy.niveles.indexOf(nv) >= 0 && S.proy.paneles.some(function (x) { return x.nivel === nv; })) return;
+          crearNivel(nv, r.panel); n++;
+        });
+        toast(n + ' nivel(es) agregados');
+        proyectoCambiado(); render();
+      });
+    },
+    'nivel-del': function (b) {
+      var P = S.proy, n = P.niveles[+b.dataset.i];
+      var usado = P.paneles.concat(P.fuentes).filter(function (x) { return x.nivel === n; }).map(function (x) { return x.tag; });
+      if (usado.length) { toast('No se puede quitar ' + n + ': lo usa ' + usado.join(', ') + '. Elimine o reasigne ese panel primero.'); return; }
+      P.niveles.splice(+b.dataset.i, 1);
+      proyectoCambiado(); renderVista();
+    },
+    'panel-add': function (b) {
+      var p = nuevoPanel(b.dataset.tipo, '');
+      S.proy.paneles.push(p);
+      proyectoCambiado(); render();
+      toast('Panel ' + p.tag + ' agregado');
+    },
+    'panel-dup': function (b) {
+      var P = S.proy, i = P.paneles.findIndex(function (x) { return x.id === b.dataset.id; });
+      var c = nuevosIdsEquipo(P.paneles[i], 'pn');
+      c.tag = tagLibre(c.tag);
+      P.paneles.splice(i + 1, 0, c);
+      proyectoCambiado(); render();
+    },
+    'panel-del': function (b) {
+      var P = S.proy, p = porId(P.paneles, b.dataset.id);
+      confirmar('Eliminar panel', '¿Eliminar <b>' + esc(p.tag) + '</b> y sus ' + p.filas.length + ' fila(s) de dispositivos?').then(function (ok) {
+        if (!ok) return;
+        quitarLazos(p.id);
+        P.paneles = P.paneles.filter(function (x) { return x !== p; });
+        if (S.tab === 'p:' + p.id) S.tab = 'proyecto';
+        proyectoCambiado(); render();
+      });
+    },
+    'fuente-add': function () {
+      var f = nuevaFuente('');
+      S.proy.fuentes.push(f);
+      proyectoCambiado(); render();
+      toast('Fuente ' + f.tag + ' agregada');
+    },
+    'amp-add': function () {
+      var f = nuevoAmplificador('');
+      S.proy.fuentes.push(f);
+      proyectoCambiado(); render();
+      toast('Amplificador ' + f.tag + ' agregado: digite sus corrientes de ficha');
+    },
+    'fuente-dup': function (b) {
+      var P = S.proy, i = P.fuentes.findIndex(function (x) { return x.id === b.dataset.id; });
+      var c = nuevosIdsEquipo(P.fuentes[i], 'fu');
+      c.tag = tagLibre(c.tag);
+      P.fuentes.splice(i + 1, 0, c);
+      proyectoCambiado(); render();
+    },
+    'fuente-del': function (b) {
+      var P = S.proy, f = porId(P.fuentes, b.dataset.id);
+      confirmar(esAmp(f) ? 'Eliminar amplificador' : 'Eliminar fuente auxiliar', '¿Eliminar <b>' + esc(f.tag) + '</b>?').then(function (ok) {
+        if (!ok) return;
+        quitarLazos(f.id);
+        P.fuentes = P.fuentes.filter(function (x) { return x !== f; });
+        if (S.tab === 'f:' + f.id) S.tab = 'proyecto';
+        proyectoCambiado(); render();
+      });
+    },
+
+    'fila-add': function (b) {
+      var eq = equipo(S.tab), n = +b.dataset.n || 1;
+      var ult = eq.filas[eq.filas.length - 1];
+      for (var i = 0; i < n; i++) eq.filas.push(nuevaFila(ult ? ult.fab : S.proy.fabricante, ult ? ult.zona : eq.nivel, ult ? ult.circ : ''));
+      proyectoCambiado(); renderVista();
+      var sel = vista.querySelectorAll('input[data-combo]');
+      if (sel.length) sel[sel.length - n].focus();
+    },
+    'fila-dup': function (b) {
+      var eq = equipo(S.tab) || equipoDeFila(b.dataset.id), i = eq.filas.findIndex(function (x) { return x.id === b.dataset.id; });
+      var c = clonar(eq.filas[i]); c.id = uid('r');
+      eq.filas.splice(i + 1, 0, c);
+      proyectoCambiado(); renderVista();
+    },
+    'fila-del': function (b) {
+      var eq = equipo(S.tab) || equipoDeFila(b.dataset.id);
+      eq.filas = eq.filas.filter(function (x) { return x.id !== b.dataset.id; });
+      proyectoCambiado(); renderVista();
+    },
+    /* Copia los lazos y dispositivos de otro equipo/nivel a este, ligados al nivel de este equipo */
+    'copiar-nivel': function () {
+      var P = S.proy, eq = equipo(S.tab);
+      var otros = P.paneles.concat(P.fuentes).filter(function (x) { return x !== eq && ((x.filas || []).some(function (f) { return f.disp; }) || lazosDe(x.id).length); });
+      if (!otros.length) { toast('No hay otro nivel con dispositivos o lazos para copiar'); return; }
+      var dest = eq.nivel || '(sin nivel)';
+      dialogo({
+        titulo: 'Copiar a ' + eq.tag + ' · ' + dest,
+        html: '<label class="campo"><span>Copiar desde</span><select name="origen">' + otros.map(function (x) {
+          return '<option value="' + esc(x.id) + '">' + esc(x.tag) + (x.nivel ? ' · ' + esc(x.nivel) : '') + ' — ' + (x.filas || []).filter(function (f) { return f.disp; }).length + ' filas, ' + lazosDe(x.id).length + ' lazos</option>';
+        }).join('') + '</select></label>' +
+          '<label class="campo"><span>Si este equipo ya tiene dispositivos o lazos</span><select name="modo"><option value="agregar">Agregar a los existentes</option><option value="reemplazar">Reemplazar (se quitan sus filas y lazos)</option></select></label>' +
+          '<p class="nota">Los lazos se crean de nuevo para este equipo y las filas quedan ligadas a ' + esc(dest) + '. Las filas de otro nivel distinto al del equipo de origen conservan su nivel.</p>',
+        ok: 'Copiar'
+      }).then(function (r) {
+        if (!r) return;
+        var src = porId(P.paneles, r.origen) || porId(P.fuentes, r.origen);
+        if (!src) return;
+        if (r.modo === 'reemplazar') { quitarLazos(eq.id); eq.filas = []; }
+        var tieneTablero = eq.filas.some(function (f) { var d = S.cx.disp[f.disp]; return d && /^(FACP|TRP)$/.test(d.tag); });
+        // lazos: se crean de nuevo en este equipo (mismo tipo, cable y longitud) y se mapean por id
+        var mapa = {}, nL = 0;
+        lazosDe(src.id).forEach(function (c) {
+          var n = clonar(c); n.id = uid('c'); n.fuente = eq.id; n.nivel = eq.nivel || c.nivel || '';
+          if (lazosDe(eq.id).some(function (x) { return x.circuito === n.circuito; })) n.circuito = nuevoCircuito(eq.id, c.tipo).circuito;
+          S.proy.caida.circuitos.push(n); mapa[c.id] = n.id; nL++;
+        });
+        var nF = 0;
+        (src.filas || []).forEach(function (f) {
+          var d = S.cx.disp[f.disp];
+          if (!f.disp && Calc.num(f.cant) === null) return;
+          if (tieneTablero && d && /^(FACP|TRP)$/.test(d.tag)) return;   // el equipo ya tiene su propia fila de panel
+          var c = clonar(f); c.id = uid('r');
+          if (!f.zona || f.zona === src.nivel) c.zona = eq.nivel || f.zona || '';
+          c.circ = mapa[f.circ] || ''; c.circ2 = mapa[f.circ2] || '';
+          eq.filas.push(c); nF++;
+        });
+        proyectoCambiado(); renderVista();
+        toast('Copiados ' + nF + ' dispositivos y ' + nL + ' lazos de ' + src.tag + ' a ' + eq.tag);
+      });
+    },
+    'filas-limpiar': function () {
+      var eq = equipo(S.tab), antes = eq.filas.length;
+      eq.filas = eq.filas.filter(function (f) { return f.disp || Calc.num(f.cant) !== null; });
+      toast((antes - eq.filas.length) + ' fila(s) vacías eliminadas');
+      proyectoCambiado(); renderVista();
+    },
+
+    'lazo-add': function (b) {
+      var tipo = b.dataset.tipo, eq = porId(S.proy.paneles, b.dataset.eq) || porId(S.proy.fuentes, b.dataset.eq);
+      function crear(clase) {
+        var c = nuevoCircuito(b.dataset.eq, tipo);
+        c.clase = clase === 'A' ? 'A' : 'B'; c.nivel = (eq && eq.nivel) || '';
+        S.proy.caida.circuitos.push(c);
+        proyectoCambiado(); renderVista();
+        toast('Lazo ' + c.circuito + (c.clase === 'A' && tipo !== '24VDC' ? ' (clase A)' : '') + ' agregado');
+      }
+      if (tipo === '24VDC') { crear('B'); return; }
+      dialogo({
+        titulo: 'Nuevo lazo ' + etiquetaTipo(tipo),
+        html: '<label class="campo"><span>Clase del circuito (NFPA 72 cap. 12)</span><select name="clase"><option value="B">Clase B — un solo camino (termina en el último dispositivo)</option><option value="A">Clase A — con retorno al panel por un segundo camino</option></select></label>',
+        ok: 'Crear'
+      }).then(function (r) { if (r) crear(r.clase); });
+    },
+    't2-on': function (el) { var eq = equipo(el.dataset.eq), f = eq && porId(eq.filas, el.dataset.id); if (!f) return; f.t2 = '24VDC'; proyectoCambiado(); renderVista(); },
+    't2-off': function (el) { var eq = equipo(el.dataset.eq), f = eq && porId(eq.filas, el.dataset.id); if (!f) return; f.t2 = ''; f.circ2 = ''; proyectoCambiado(); renderVista(); },
+    'lazo-nuevo': function (sel) {
+      var eq = equipo(sel.dataset.eq), f = porId(eq.filas, sel.dataset.id), d = S.cx.disp[f.disp];
+      dialogo({
+        titulo: 'Nuevo lazo en ' + eq.tag,
+        html: '<label class="campo"><span>Tipo de lazo</span><select name="tipo">' + optsTiposLazo(sel.dataset.k === 'circ2' ? Calc.tipoLazo2De(Calc.dispFila(d, f)) : Calc.tipoLazoDe(Calc.dispFila(d, f))) + '</select></label>' +
+          '<label class="campo"><span>Nombre (opcional)</span><input name="nombre" placeholder="Ej.: SLC 2"></label>' +
+          '<label class="campo"><span>Clase del circuito</span><select name="clase"><option value="B">Clase B — un solo camino</option><option value="A">Clase A — con retorno al panel</option></select></label>',
+        ok: 'Crear'
+      }).then(function (r) {
+        if (!r) { renderVista(); return; }
+        var c = nuevoCircuito(eq.id, r.tipo);
+        c.clase = r.clase === 'A' ? 'A' : 'B';
+        if (r.nombre.trim()) c.circuito = r.nombre.trim();
+        c.nivel = f.zona || eq.nivel || '';
+        S.proy.caida.circuitos.push(c);
+        f[sel.dataset.k === 'circ2' ? 'circ2' : 'circ'] = c.id;
+        proyectoCambiado(); renderVista();
+        toast('Lazo ' + c.circuito + ' creado y asignado');
+      });
+    },
+    'circ-add': function (b) {
+      var cs = S.proy.caida.circuitos, ult = cs[cs.length - 1];
+      var c = nuevoCircuito(ult ? ult.fuente : undefined, ult ? ult.tipo : 'NAC');
+      cs.push(c);
+      proyectoCambiado(); renderVista();
+    },
+    'circ-dup': function (b) {
+      var cs = S.proy.caida.circuitos, i = cs.findIndex(function (x) { return x.id === b.dataset.id; });
+      var c = clonar(cs[i]); c.id = uid('c'); c.circuito = c.circuito + ' (copia)';
+      cs.splice(i + 1, 0, c);
+      proyectoCambiado(); renderVista();
+    },
+    'circ-del': function (b) {
+      var id = b.dataset.id;
+      S.proy.caida.circuitos = S.proy.caida.circuitos.filter(function (x) { return x.id !== id; });
+      S.proy.paneles.concat(S.proy.fuentes).forEach(function (e) { e.filas.forEach(function (f) { if (f.circ === id) f.circ = ''; if (f.circ2 === id) f.circ2 = ''; }); });
+      proyectoCambiado(); renderVista();
+    },
+
+
+    /* ----- láminas ----- */
+    'lam-sel': function (b) { S.lam = b.dataset.id; S.lamView = null; renderVista(); },
+    'sb-base': function () {
+      confirmar('Restablecer simbología', 'Se quitan los cambios de modo, descripción y referencia de la simbología de este proyecto. ¿Continuar?', 'Restablecer').then(function (ok) {
+        if (!ok) return; S.proy.simbDU = {}; proyectoCambiado(); renderVista();
+      });
+    },
+    'nu-add': function (b) {
+      var N = notasDUProy(), g = b.dataset.g;
+      N[g].push({ id: uid('n'), on: true, txt: b.dataset.item ? 'NUEVO BOTÓN DE DESCONEXIÓN' : 'Nueva nota', grupo: b.dataset.item ? 'i' : '' });
+      proyectoCambiado(); renderVista();
+    },
+    'nu-del': function (b) { var N = notasDUProy(); N[b.dataset.g] = N[b.dataset.g].filter(function (x) { return x.id !== b.dataset.id; }); proyectoCambiado(); renderVista(); },
+    'nu-base': function () {
+      confirmar('Restablecer notas', 'Se reemplazan las notas del diagrama por las notas base. ¿Continuar?', 'Restablecer').then(function (ok) {
+        if (!ok) return; S.proy.notasDU = Lamina.notasDUBase(); proyectoCambiado(); renderVista();
+      });
+    },
+    'mov-reset': function () { S.proy.duMov = {}; proyectoCambiado(); pintarLamina(); toast('Textos en su posición original'); },
+    'z-in': function () { if (S.lamZoom) S.lamZoom(1.3); },
+    'z-out': function () { if (S.lamZoom) S.lamZoom(1 / 1.3); },
+    'z-fit': function () { if (S.lamAjustar) S.lamAjustar(); },
+    'lam-dxf': function () { descargarDXF(S.lam || 'du'); toast('DXF generado'); },
+    'lam-dxf-hojas': function () { descargarDXF(S.lam || 'du', true); toast('DXF en láminas 1100 × 750 generado'); },
+    'lam-pdf-hojas': function () {
+      var id = S.lam || 'du', url = new URL('deteccion/img/logo-sinergia.png', location.href).href;
+      var w = window.open('', '_blank');
+      if (!w) { toast('Permita las ventanas emergentes para generar el PDF'); return; }
+      w.document.open(); w.document.write(Lamina.htmlHojas(id, ctxLamina(), url, nombreDXF(id).replace(/\.dxf$/, ''))); w.document.close();
+      setTimeout(function () { w.focus(); w.print(); }, 900);
+      toast('En el cuadro de impresión: Guardar como PDF, tamaño 1100 × 750 mm (o A0), márgenes ninguno, sin encabezados');
+    },
+    'lam-dxf-todas': function () { LAMINAS.forEach(function (l, i) { setTimeout(function () { descargarDXF(l.id); }, i * 400); }); toast('Se descargan ' + LAMINAS.length + ' archivos DXF'); },
+    'mat-base': function () {
+      confirmar('Restablecer matriz', 'Se reemplaza la matriz del proyecto por la matriz base. ¿Continuar?', 'Restablecer').then(function (ok) {
+        if (!ok) return; S.proy.matriz = Lamina.matrizBase(); proyectoCambiado(); renderVista();
+      });
+    },
+    'mat-fila': function () { var M = matrizProy(); M.salidas.push({ id: uid('s'), texto: 'Nueva función de salida', nota: '', marcas: {} }); proyectoCambiado(); renderVista(); },
+    'mat-col': function () { var M = matrizProy(); M.entradas.push({ id: uid('e'), nombre: 'Nueva señal de entrada' }); proyectoCambiado(); renderVista(); },
+    'mat-fila-del': function (b) { var M = matrizProy(); M.salidas = M.salidas.filter(function (x) { return x.id !== b.dataset.id; }); proyectoCambiado(); renderVista(); },
+    'mat-col-del': function (b) {
+      var M = matrizProy(); M.entradas = M.entradas.filter(function (x) { return x.id !== b.dataset.id; });
+      M.salidas.forEach(function (s) { delete (s.marcas || {})[b.dataset.id]; }); proyectoCambiado(); renderVista();
+    },
+    'mat-importar': function () {
+      var inp = document.createElement('input');
+      inp.type = 'file'; inp.accept = '.pdf,.xlsx,.xls,.xlsm,.csv,.docx';
+      inp.onchange = function () {
+        var f = inp.files[0]; if (!f) return;
+        toast('Leyendo ' + f.name + '…');
+        Lamina.importarArchivo(f).then(function (m) {
+          if (!m || !m.salidas.length) { toast('No se encontró una matriz (tabla con marcas X) en ' + f.name); return; }
+          m.fuente = 'Importada de ' + f.name;
+          S.proy.matriz = m; proyectoCambiado(); renderVista();
+          toast('Matriz importada: ' + m.salidas.length + ' salidas × ' + m.entradas.length + ' entradas, ' + m.notas.length + ' notas. Revise los textos.');
+        }).catch(function (err) { toast('⚠ ' + ((err && err.message) || err)); });
+      };
+      inp.click();
+    },
+
+    /* ----- administración ----- */
+    'admin-sub': function (b) { S.adminSub = b.dataset.sub; renderVista(); },
+    'cat-add': function () {
+      var sub = S.adminSub, x;
+      if (sub === 'dispositivos') x = { id: uid('d'), fabricante: S.adminFiltro.fab || (S.cat.fabricantes[0] || {}).id, modelo: '', tag: '', tipo: '', descripcion: '', iEspera: 0, iAlarma: 0, circuito: '', obs: '' };
+      else if (sub === 'cables') x = { id: uid('c'), fabricante: '', modelo: '', awg: 16, conductores: 2, pantalla: 'NO', listado: 'FPLR', rKm: null, uso: '', obs: '' };
+      else if (sub === 'baterias') x = { id: uid('b'), ah: null, refSimplex: '', refNotifier: '', refGenerica: '', obs: '' };
+      else x = { id: uid('fab'), nombre: '' };
+      S.adminFiltro.q = '';
+      S.cat[sub].push(x);
+      catalogoCambiado(sub); renderVista();
+      var tr = vista.querySelector('tr[data-row="' + x.id + '"]');
+      if (tr) { tr.scrollIntoView({ block: 'center' }); var inp = tr.querySelector('input'); if (inp) inp.focus(); }
+      if (sub === 'baterias') toast('Digite la capacidad; la lista se reordena al volver a esta pestaña');
+    },
+    'cat-dup': function (b) {
+      var l = S.cat[S.adminSub], i = l.findIndex(function (x) { return x.id === b.dataset.id; });
+      var c = clonar(l[i]); c.id = uid(S.adminSub.charAt(0));
+      l.splice(i + 1, 0, c);
+      catalogoCambiado(S.adminSub); renderVista();
+    },
+    'cat-del': function (b) {
+      var sub = S.adminSub, x = porId(S.cat[sub], b.dataset.id);
+      if (sub === 'fabricantes' && Calc.dispositivosDe(S.cx, x.id).length) {
+        toast('No se puede eliminar: el fabricante tiene dispositivos. Elimínelos o reasígnelos primero.');
+        return;
+      }
+      var nombre = x.nombre || [x.fabricante, x.modelo, x.tag].filter(Boolean).join(' ') || (x.ah ? x.ah + ' Ah' : 'este registro');
+      confirmar('Eliminar del catálogo', '¿Eliminar <b>' + esc(nombre) + '</b>? Los proyectos que lo usen mostrarán «no está en el catálogo».').then(function (ok) {
+        if (!ok) return;
+        S.cat[sub] = S.cat[sub].filter(function (y) { return y !== x; });
+        catalogoCambiado(sub); renderVista();
+      });
+    },
+    'cat-exportar': function () { descargar('catalogo-baterias-alarma-' + hoy() + '.json', S.cat); },
+    'cat-importar': function () { S.importModo = 'catalogo'; document.getElementById('fileInput').click(); },
+    'cat-restablecer': function () {
+      confirmar('Restablecer catálogo', 'Se reemplazará el catálogo actual por el catálogo base (del Excel). Los cambios del administrador se perderán. ¿Continuar?', 'Restablecer').then(function (ok) {
+        if (!ok) return;
+        Store.restablecerCatalogo().then(function (c) { S.cat = c; S.cx = Calc.preparar(c); render(); toast('Catálogo base restablecido'); })
+          .catch(function (e) { toast('⚠ ' + msgError(e)); });
+      });
+    },
+    'cat-semilla': function () {
+      var base = clonar(window.CATALOGO_BASE);
+      Store.saveCatalogo(base).then(function () {
+        S.cat = base; S.cx = Calc.preparar(base); render(); toast('Catálogo base cargado en Supabase');
+      }).catch(function (e) { toast('⚠ ' + msgError(e)); });
+    }
+  };
+
+  vista.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-act]');
+    if (!b || !vista.contains(b)) return;
+    var f = acciones[b.dataset.act];
+    if (b.tagName === 'A') e.preventDefault();
+    if (f) f(b);
+  });
+  vista.addEventListener('keydown', function (e) {
+  });
+
+  tabsEl.addEventListener('click', function (e) {
+    var a = e.target.closest('[data-act]');
+    if (a && acciones[a.dataset.act]) { acciones[a.dataset.act](a); return; }
+    var b = e.target.closest('[data-tab]');
+    if (b) irA(b.dataset.tab);
+  });
+
+  /* ----- proyecto: lo da la Suite ----- */
+  function abrirProyecto(p, tab, guardar) {
+    var suite = Store.proyecto();
+    p.numero = suite.numero; p.nombre = suite.nombre;
+    // datos generales: los define el proyecto de la Suite
+    p.cliente = suite.cliente; p.ubicacion = suite.ubicacion; p.elaboro = suite.elaboro; p.reviso = suite.reviso; p.empresa = suite.empresa;      // el número y el nombre los define la Suite
+    S.proy = normalizar(p);
+    S.tab = tab || 'proyecto';
+    var paso = guardar ? guardarYa() : Promise.resolve();
+    return paso.then(function () { render(); });
+  }
+
+  /* ----- importar catálogo (.json), solo administrador ----- */
+  document.getElementById('fileInput').addEventListener('change', function (e) {
+    var file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    file.text().then(function (txt) {
+      var d = JSON.parse(txt);
+      if (!d.dispositivos || !d.baterias || !d.cables) throw new Error('El archivo no es un catálogo válido');
+      return confirmar('Importar catálogo', 'Se reemplazará el catálogo actual (' + S.cat.dispositivos.length + ' dispositivos) por el del archivo (' + d.dispositivos.length + ' dispositivos). ¿Continuar?', 'Importar').then(function (ok) {
+        if (!ok) return;
+        d.fabricantes = d.fabricantes || [];
+        S.cat = d;
+        catalogoCambiado();
+        render();
+        toast('Catálogo importado');
+      });
+    }).catch(function (err) { toast('⚠ No se pudo importar: ' + err.message); });
+  });
+
+  window.addEventListener('beforeunload', function (e) {
+    if (!S.tGuardar) return;
+    e.preventDefault(); e.returnValue = '';
+  });
+
+  /* ======================= inicio ======================= */
+  /* Enlace directo a una sección: ...#memoria, #caida o #proyecto */
+  function tabInicial() {
+    var h = String(location.hash || '').slice(1);
+    return ['proyecto', 'caida', 'memoria'].indexOf(h) >= 0 ? h : undefined;
+  }
+
+  // Lo llama la página después de verificar la sesión y de leer el proyecto de la Suite
+  window.DeteccionInit = function () {
+    return Store.getCatalogo().then(function (cat) {
+      S.cat = cat;
+      S.cat.fabricantes = S.cat.fabricantes || [];
+      S.cx = Calc.preparar(cat);
+      return Store.getProyecto();
+    }).then(function (p) {
+      var nuevo = !p;
+      // Primer uso: proyecto en blanco con un solo nivel; los demás se agregan con «+ Nivel»
+      if (nuevo) p = proyectoConPrimerNivel(Store.proyecto().nombre, 'NIVEL 1');
+      return abrirProyecto(p, tabInicial(), nuevo);
+    }).then(function () {
+      // Si otro usuario guarda, se carga su versión al volver a la pestaña (sin pisar lo que se esté editando)
+      document.addEventListener('visibilitychange', function () {
+        if (document.hidden || S.tGuardar || S.enConflicto) return;
+        Store.changed().then(function (cambio) {
+          if (!cambio) return;
+          return Store.getProyecto().then(function (p) {
+            if (p) return abrirProyecto(p, S.tab, false).then(function () { toast('Proyecto actualizado por otro usuario'); });
+          });
+        });
+      });
+    });
+  };
+})();

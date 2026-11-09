@@ -1,0 +1,206 @@
+/* ============================================================
+   Sinergia Suite · Materialidad macOS
+   ------------------------------------------------------------
+   Tercera capa. Orden de enlace:
+     eva-ui.css → suite-color.css → suite-mac.css → (portal | app)
+
+   No define estructura ni color: define de qué está hecha la
+   superficie. Sirve igual al portal y a cualquier aplicación.
+
+   ------------------------------------------------------------
+   QUÉ HACE QUE ALGO SE LEA COMO APPLE
+   ------------------------------------------------------------
+   No es «minimalismo» ni esquinas redondas. Son cuatro cosas
+   concretas, y acá están las cuatro:
+
+   1. La tesela con hombro (squircle). El ícono deja de ser un
+      trazo suelto y pasa a ser una app: figura sólida, glifo
+      blanco encima. Es LA señal de macOS.
+   2. Luz física. Degradado de arriba hacia abajo, filo interior
+      claro en el borde superior y sombra teñida del propio color.
+      El objeto parece iluminado desde arriba, no pintado.
+   3. Material translúcido. Las superficies flotantes desenfocan
+      lo que tienen detrás en vez de taparlo.
+   4. Movimiento con inercia. La curva sobrepasa y vuelve; nada se
+      mueve a velocidad constante.
+
+   Si agregás algo a una pantalla, pasalo por estas cuatro y va a
+   pertenecer. Si solo le ponés esquinas redondas, no.
+   ============================================================ */
+
+:root{
+  /* El casi-blanco de las páginas de Apple. Sobre blanco puro las
+     sombras suaves se ven sucias; sobre este gris respiran. */
+  --mac-fondo:#FBFBFD;
+
+  /* Curva con rebote. Una transición lineal se siente mecánica;
+     el sobrepaso es lo que da sensación de masa. */
+  --mac-resorte:cubic-bezier(.34,1.4,.64,1);
+
+  /* Material translúcido, en un solo lugar para que todas las
+     superficies flotantes tengan la misma receta. */
+  --mac-vidrio:rgba(255,255,255,.72);
+  --mac-vidrio-solido:rgba(255,255,255,.92);
+  --mac-filo:1px solid rgba(0,0,0,.06);
+}
+
+
+/* ============================================================
+   Fondo y texto
+   ============================================================ */
+
+/* Dos lavados de color casi imperceptibles en las esquinas altas.
+   Cumplen dos funciones: rompen la planicie del blanco y le dan al
+   material translúcido algo que desenfocar —un blur sobre blanco
+   puro no se distingue de un fondo opaco. */
+body{
+  background:
+    radial-gradient(900px 520px at 16% -8%,
+      color-mix(in oklab, var(--app) 7%, transparent), transparent 62%),
+    radial-gradient(780px 460px at 86% 0%,
+      color-mix(in oklab, var(--app) 5%, transparent), transparent 60%),
+    var(--mac-fondo);
+  background-attachment:fixed;
+  /* El suavizado fino es parte del look: en macOS la tipografía de
+     Apple se dibuja más delgada que por defecto. */
+  -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
+}
+
+
+/* ============================================================
+   La tesela
+   ------------------------------------------------------------
+   El objeto característico del sistema. Se usa grande en la
+   rejilla del portal (76px) y chica en el encabezado de una app
+   (30px); es la misma pieza, solo cambia --tesela.
+   ============================================================ */
+.tesela{
+  --tesela:76px;
+  width:var(--tesela);height:var(--tesela);flex:none;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:23%;        /* proporción de la squircle de Apple */
+  corner-shape:squircle;    /* el hombro real, donde el motor lo soporta */
+  background:linear-gradient(178deg, var(--app-alto) 0%, var(--app-bajo) 100%);
+  box-shadow:
+    0 10px 20px -8px color-mix(in oklab, var(--app) 58%, transparent),
+    0 2px 6px -2px rgba(0,0,0,.10),
+    inset 0 1px 0 rgba(255,255,255,.32);   /* filo de luz superior */
+  transition:box-shadow .34s ease;
+}
+
+/* El glifo va en blanco. El acento del duotono no cambia de color:
+   cambia de opacidad, igual que los símbolos jerárquicos de SF. */
+.tesela{--app-f:rgba(255,255,255,.62)}
+.tesela svg{
+  width:calc(var(--tesela) * .53);height:calc(var(--tesela) * .53);
+  stroke:#fff;fill:none;stroke-width:1.3;
+  stroke-linecap:round;stroke-linejoin:round;
+}
+
+/* Tesela chica: la sombra teñida a 30px se ve como suciedad. */
+.tesela--sm{
+  --tesela:30px;border-radius:26%;
+  box-shadow:
+    0 2px 5px -2px color-mix(in oklab, var(--app) 50%, transparent),
+    inset 0 1px 0 rgba(255,255,255,.30);
+}
+
+/* Enfocada: mismo degradado con un velo blanco del 10% encima. En
+   Launchpad el ícono no cambia de color, solo parece recibir más
+   luz. El fondo se repite entero porque un velo no se puede sumar
+   a una capa que no se está redeclarando. */
+.tesela--activa,
+a:hover > .tesela, button:hover > .tesela{
+  background:
+    linear-gradient(rgba(255,255,255,.10), rgba(255,255,255,.10)),
+    linear-gradient(178deg, var(--app-alto) 0%, var(--app-bajo) 100%);
+  box-shadow:
+    0 18px 30px -10px color-mix(in oklab, var(--app) 66%, transparent),
+    0 3px 8px -2px rgba(0,0,0,.12),
+    inset 0 1px 0 rgba(255,255,255,.38);
+}
+
+/* Deshabilitada: gris, no translúcida. Una tesela al 40% de
+   opacidad se ve rota; en escala de grises se lee apagada. */
+.tesela--off{filter:grayscale(1) opacity(.42);box-shadow:none}
+
+
+/* ============================================================
+   Superficies translúcidas
+   ------------------------------------------------------------
+   Cualquier cosa que flote sobre el contenido —encabezado fijo,
+   panel de resultados, menú— usa esta receta. Es lo que hace que
+   la página se sienta de vidrio y no de cartón.
+   ============================================================ */
+.vidrio{
+  background:var(--mac-vidrio);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  backdrop-filter:blur(24px) saturate(180%);
+  border:var(--mac-filo);
+}
+
+/* TRAMPA CONOCIDA: backdrop-filter crea un contexto de apilado, y
+   la superficie se pinta por encima de los elementos absolutos que
+   la precedan en el marcado —típicamente el ícono dentro de un
+   campo de búsqueda, que desaparece sin aviso. Si algo se te
+   esfuma al agregar vidrio, subile el z-index. */
+.vidrio ~ .sobre-vidrio,
+.buscador .bi{z-index:1}
+
+
+/* ============================================================
+   Campos y superficies flotantes
+   ============================================================ */
+.buscador input{
+  font-size:14px;padding:17px 52px;border-radius:16px;
+  background:var(--mac-vidrio);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  backdrop-filter:blur(24px) saturate(180%);
+  border:var(--mac-filo);
+  box-shadow:0 12px 30px -10px rgba(0,0,0,.16), 0 1px 2px rgba(0,0,0,.04);
+  transition:box-shadow .25s ease, background .25s ease;
+}
+.buscador input:focus{
+  background:var(--mac-vidrio-solido);
+  border-color:rgba(0,0,0,.08);
+  box-shadow:0 18px 40px -12px rgba(0,0,0,.20),
+             0 0 0 4px color-mix(in oklab, var(--app) 16%, transparent);
+}
+.buscador .bi{left:22px;display:flex}
+.buscador .bi svg{
+  width:16px;height:16px;stroke:currentColor;fill:none;
+  stroke-width:1.7;stroke-linecap:round;display:block;
+}
+
+/* Panel flotante: resultados, menús, sugerencias */
+.panel-flotante{
+  border-radius:16px;border:var(--mac-filo);
+  background:rgba(255,255,255,.88);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  backdrop-filter:blur(24px) saturate(180%);
+  box-shadow:0 20px 44px -12px rgba(0,0,0,.20);
+}
+
+
+/* ============================================================
+   Tipografía
+   ------------------------------------------------------------
+   Montserrat sigue siendo la fuente. Lo que cambia es el ajuste
+   óptico: interletrado negativo en los tamaños grandes, que es
+   como Apple compone sus titulares.
+   ============================================================ */
+h1{letter-spacing:-.03em}
+h2,.seccion-tit{letter-spacing:-.015em}
+
+
+/* ============================================================
+   Movimiento
+   ============================================================ */
+.elevable{transition:transform .34s var(--mac-resorte)}
+.elevable:hover{transform:translateY(-5px) scale(1.035)}
+
+@media(prefers-reduced-motion:reduce){
+  .elevable,.tesela{transition:none}
+  .elevable:hover{transform:none}
+}

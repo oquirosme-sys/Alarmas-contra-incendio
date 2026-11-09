@@ -1,0 +1,177 @@
+/* ============================================================
+   Sinergia Suite · Registro de color por aplicación
+   ------------------------------------------------------------
+   Segunda capa. Orden de enlace:
+     eva-ui.css → suite-color.css → suite-mac.css → (portal | app)
+
+   Esta hoja no dibuja nada. Solo responde una pregunta: «¿de qué
+   color es esta aplicación?». Se declara con un atributo:
+
+     <body data-app="pyrocheck">     → toda la página en rojo
+     <a class="app" data-app="eva">  → esa tesela en verde
+
+   Mismo mecanismo en el portal y dentro de cada app. Todo lo demás
+   —teselas, botones, foco, encabezado— lee var(--app) y se pinta
+   solo. Cambiar la identidad de una página es cambiar una palabra.
+
+   ------------------------------------------------------------
+   CÓMO SE DERIVÓ LA PALETA
+   ------------------------------------------------------------
+   Los colores no se eligieron a ojo. Se midió el verde de marca
+   (#386633) en OKLCH —L 0.464 · C 0.094 · H 142— y los demás se
+   generaron a esa MISMA luminosidad, rotando solo el tono. Que
+   compartan L es lo que impide que uno grite por encima de otro:
+   los cuatro pesan igual sobre el blanco.
+
+   El chroma sí se ajusta por tono, porque el ojo no lo percibe
+   parejo entre matices: a C 0.094 el rojo se apaga en terracota y
+   deja de leerse como fuego. Los valores —verde 0.094, rojo 0.125,
+   azul 0.105, violeta 0.105— igualan la saturación percibida, no
+   la numérica.
+
+   Las variantes salen del mismo tono, moviendo solo luminosidad:
+     --app-alto   L +0.085   parada clara del degradado
+     --app-bajo   L −0.035   parada oscura del degradado
+     --app-f      L −0.105   acento del duotono
+
+   El blanco sobre --app-alto conserva 4.7:1 de contraste, así que
+   el glifo se lee incluso en la zona más clara de la tesela.
+
+   Para agregar una aplicación, ver references/paleta.md. No
+   muestrees un color suelto: seguí la receta o va a desentonar.
+   ============================================================ */
+
+
+/* ------------------------------------------------------------
+   Los cuatro colores de disciplina
+   ------------------------------------------------------------ */
+:root{
+  /* Generales · transversal a todos los proyectos */
+  --disc-general:#386633;
+  --disc-general-alto:#507F4B;   --disc-general-bajo:#2E5C29;   --disc-general-f:#1A4816;
+
+  /* Incendio · protección contra incendios */
+  --disc-incendio:#92372D;
+  --disc-incendio-alto:#AE5045;  --disc-incendio-bajo:#872C23;  --disc-incendio-f:#701610;
+
+  /* Eléctrica · sistemas eléctricos */
+  --disc-electrica:#285B92;
+  --disc-electrica-alto:#4174AD; --disc-electrica-bajo:#1D5187; --disc-electrica-f:#043D71;
+
+  /* MEP · mecánica, eléctrica y plomería.
+     Es el único matiz que quedaba libre: el ámbar chocaría con el
+     rojo de incendio y con --warn del sistema, y el petróleo se
+     confunde con el verde a tamaño de ícono. */
+  --disc-mep:#694786;
+  --disc-mep-alto:#825FA0;       --disc-mep-bajo:#5F3D7B;       --disc-mep-f:#4C2A66;
+
+  /* Sin data-app, todo cae en verde de marca. Una página que se
+     olvidó de declararse se ve correcta, no rota. */
+  --app:var(--disc-general);
+  --app-alto:var(--disc-general-alto);
+  --app-bajo:var(--disc-general-bajo);
+  --app-f:var(--disc-general-f);
+}
+
+
+/* ------------------------------------------------------------
+   El registro: qué aplicación usa qué disciplina
+   ------------------------------------------------------------
+   Eva y Blas comparten verde, Eskedul y AutoSub G comparten
+   violeta. Es deliberado: el color agrupa por disciplina, no
+   distingue una app de otra. Si algún día hay que separarlas,
+   se genera un tono nuevo con la receta de references/paleta.md
+   y se cambia solo la línea de esa app.
+   ------------------------------------------------------------ */
+
+/* Eva · organiza proyectos, tareas y el día */
+[data-app="eva"],
+/* Blas · revisa la calidad de los entregables */
+[data-app="blas"]{
+  --app:var(--disc-general);
+  --app-alto:var(--disc-general-alto);
+  --app-bajo:var(--disc-general-bajo);
+  --app-f:var(--disc-general-f);
+}
+
+/* PyroCheck · verifica el reglamento de bomberos */
+[data-app="pyrocheck"]{
+  --app:var(--disc-incendio);
+  --app-alto:var(--disc-incendio-alto);
+  --app-bajo:var(--disc-incendio-bajo);
+  --app-f:var(--disc-incendio-f);
+}
+
+/* AutoSub D · valida submittals de tableros eléctricos */
+[data-app="autosub-d"]{
+  --app:var(--disc-electrica);
+  --app-alto:var(--disc-electrica-alto);
+  --app-bajo:var(--disc-electrica-bajo);
+  --app-f:var(--disc-electrica-f);
+}
+
+/* Eskedul · genera tablas de equipos */
+[data-app="eskedul"],
+/* AutoSub G · revisa submittals y detecta desvíos */
+[data-app="autosub-g"]{
+  --app:var(--disc-mep);
+  --app-alto:var(--disc-mep-alto);
+  --app-bajo:var(--disc-mep-bajo);
+  --app-f:var(--disc-mep-f);
+}
+
+/* SNG Electrical · paquete de herramientas del equipo eléctrico.
+   Misma disciplina que AutoSub D: usa los tonos de Eléctrica. */
+[data-app="sng-electrical"]{
+  --app:var(--disc-electrica);
+  --app-alto:var(--disc-electrica-alto);
+  --app-bajo:var(--disc-electrica-bajo);
+  --app-f:var(--disc-electrica-f);
+}
+
+/* El portal no es de ninguna disciplina: su identidad es el logo.
+   Se queda en el verde de marca. */
+[data-app="suite"]{
+  --app:var(--disc-general);
+  --app-alto:var(--disc-general-alto);
+  --app-bajo:var(--disc-general-bajo);
+  --app-f:var(--disc-general-f);
+}
+
+
+/* ------------------------------------------------------------
+   Lo que el color de la app SÍ toca
+   ------------------------------------------------------------
+   Acciones, foco e identidad. eva-ui.css los define en verde de
+   marca; acá se redirigen a var(--app) para que entrar a PyroCheck
+   se sienta distinto de entrar a Eva.
+   ------------------------------------------------------------ */
+/* Las variantes se excluyen una por una y no es un capricho: en
+   eva-ui.css .btn--ghost, .btn--danger y .btn--warn se dibujan con
+   fondo transparente. Un `.btn{background:...}` a secas les gana
+   por orden de hoja y las convierte a las tres en botones sólidos
+   del color de la app —el botón de cancelar pasa a verse como el
+   de confirmar, y el destructivo pierde su rojo—. */
+.btn:not(.btn--ghost):not(.btn--danger):not(.btn--warn){background:var(--app)}
+.btn:not(.btn--ghost):not(.btn--danger):not(.btn--warn):hover{background:var(--app-bajo)}
+
+input:focus,select:focus,textarea:focus{
+  border-color:var(--app);
+  box-shadow:0 0 0 3px color-mix(in oklab, var(--app) 18%, transparent);
+}
+.link-btn{color:var(--app)}
+.tab.active{color:var(--app);border-bottom-color:var(--app)}
+
+
+/* ------------------------------------------------------------
+   Lo que el color de la app NUNCA toca
+   ------------------------------------------------------------
+   Los colores de estado son semánticos: comunican severidad, no
+   identidad. Si en PyroCheck el rojo pasara a ser «el color de la
+   app», un error dejaría de distinguirse de un botón cualquiera y
+   el usuario perdería la única señal que tiene para leer gravedad.
+
+   Por eso .btn--danger, .btn--warn, .badge--*, .msg--* y los KPI
+   de estado se quedan como los define eva-ui.css. No los redirijas
+   a var(--app) ni siquiera «para que combine».
+   ------------------------------------------------------------ */

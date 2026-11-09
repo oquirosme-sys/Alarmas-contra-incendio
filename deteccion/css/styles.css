@@ -1,0 +1,180 @@
+/* Capa 1 · styles.css — sistema corporativo (tokens + componentes de contenido).
+   Las capas siguientes (suite-color, suite-mac, suite-app) ponen la identidad, la materialidad y el armazón.
+   Entrada manual = campo blanco con borde; cálculo automático = fondo gris. */
+.cm *{ box-sizing: border-box; }
+.cm .sr-only{ position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.cm h1,.cm h2,.cm h3,.cm h4{ margin: 0; line-height: 1.25; }
+.cm h2{ font-size: 18px; }
+.cm h3{ font-size: 15px; }
+.cm a{ color: var(--primary); }
+.cm .muted{ color: var(--muted); }
+.cm button,.cm input,.cm select,.cm textarea{ font: inherit; }
+.cm button{ cursor: pointer; }
+/* El armazón (barra, secciones, página, pie) vive en suite-app.css */
+/* ---------- Botones ---------- */
+/* ---------- Indicadores de estado de las secciones (conservan sus colores de estado) ---------- */
+/* ---------- Página ---------- */
+.cm .encabezado{ display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+.cm .encabezado h2{ font-size: 20px; }
+.cm .encabezado .sub{ color: var(--muted); font-size: 13px; margin-top: 2px; }
+.cm .encabezado .acciones{ display: flex; gap: 8px; flex-wrap: wrap; }
+.cm .card{ background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 16px; }
+.cm .card-h{ padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.cm .card-h h3{ font-size: 15px; }
+.cm .card-h .nota{ color: var(--muted); font-size: 12px; }
+.cm .card-b{ padding: 16px; }
+.cm .card-b.flush{ padding: 0; }
+.cm .grid{ display: grid; gap: 12px 16px; }
+.cm .grid.c2{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cm .grid.c3{ grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.cm .grid.c4{ grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.cm .grid-2col{ display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 1000px){.cm .grid-2col{ grid-template-columns: 1fr; }
+}
+@media (max-width: 800px){.cm .grid.c3,.cm .grid.c4{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px){.cm .grid.c2,.cm .grid.c3,.cm .grid.c4{ grid-template-columns: 1fr; }
+}
+.cm .campo{ display: flex; flex-direction: column; gap: 4px; }
+.cm .campo > span{ font-size: 12px; color: var(--muted); font-weight: 500; }
+.cm .campo small{ color: var(--muted); font-size: 11px; }
+.cm .in,.cm .campo input,.cm .campo select,.cm .campo textarea,.cm .field select,.cm .field input{
+  color: var(--text); background: var(--input-bg); border: 1px solid var(--input-line); border-radius: 6px; padding: 6px 8px; width: 100%; min-width: 0;
+}
+.cm .field{ display: flex; flex-direction: column; gap: 4px; }
+.cm .field > span{ font-size: 12px; color: var(--muted); }
+.cm .in:focus,.cm .campo input:focus,.cm .campo select:focus,.cm .campo textarea:focus,.cm .field select:focus{
+  outline: 2px solid var(--primary); outline-offset: -1px; border-color: var(--primary);
+}
+.cm input[type="number"]{ font-variant-numeric: tabular-nums; }
+.cm input[type="checkbox"]{ width: 16px; height: 16px; }
+.cm input::placeholder{ color: var(--muted); opacity: .5; font-style: italic; }
+/* ejemplo tenue: desaparece al escribir */
+/* selector de proyecto: no es un campo de captura */
+/* ---------- Tablas de la aplicación ---------- */
+.cm .tabla-wrap{ overflow-x: auto; }
+.cm table.t{ border-collapse: collapse; width: 100%; font-size: 13px; }
+.cm .t th{ background: var(--surface-2); color: var(--app, var(--muted)); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .02em; text-align: left; padding: 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.cm .t th.num,.cm .t td.num{ text-align: right; }
+.cm .t td{ padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.cm .t tbody tr:hover td{ background: var(--surface-2); }
+.cm .t td.calc{ background: var(--calc-bg); color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cm .t td.muted{ color: var(--muted); }
+.cm .t td .in{ padding: 4px 6px; min-width: 60px; }
+.cm .t td select.in{ min-width: 110px; }
+.cm .t td .in.w-xs{ width: 64px; min-width: 64px; }
+.cm .t td .in.w-sm{ width: 90px; min-width: 90px; }
+.cm .t td .in.w-md{ min-width: 150px; }
+.cm .t td .in.w-lg{ min-width: 240px; }
+.cm .t td .in.w-xl{ min-width: 340px; }
+.cm .t td .in.editado{ background: var(--warn-soft); border-color: var(--warn); }
+.cm .t tfoot td{ font-weight: 600; background: var(--surface-2); padding: 8px; border-top: 1px solid var(--border); }
+.cm .t .idx{ color: var(--muted); font-size: 11px; width: 28px; text-align: center; }
+.cm .t td.desc{ max-width: 280px; color: var(--muted); font-size: 12px; }
+.cm .t tr.aviso-error td{ background: var(--err-soft); }
+.cm .sel-cat{ font-weight: 600; }
+.cm .vacio{ text-align: center; color: var(--muted); padding: 28px 16px; }
+.cm .vacio .btn{ margin-top: 10px; }
+/* ---------- Estados ---------- */
+.cm .badge{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+.cm .badge.ok{ background: var(--ok-soft); color: var(--ok); }
+.cm .badge.error{ background: var(--err-soft); color: var(--err); }
+.cm .badge.warn{ background: var(--warn-soft); color: var(--warn); }
+.cm .badge.pend{ background: var(--calc-bg); color: var(--muted); }
+.cm .aviso{ font-size: 11.5px; white-space: nowrap; }
+.cm .aviso.error{ color: var(--err); }
+.cm .aviso.warn{ color: var(--warn); }
+/* ---------- Resultado de batería ---------- */
+.cm .calc-lista{ display: grid; grid-template-columns: 1fr auto auto; gap: 0; font-size: 13px; }
+.cm .calc-lista > div{ padding: 7px 0; border-bottom: 1px dashed var(--border); }
+.cm .calc-lista .v{ text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; padding-left: 12px; }
+.cm .calc-lista .u{ color: var(--muted); padding-left: 6px; font-size: 12px; }
+.cm .calc-lista .f{ color: var(--muted); font-size: 11.5px; grid-column: 1 / -1; border-bottom: none; padding: 0 0 6px; margin-top: -4px; font-family: var(--mono); }
+.cm .resultado{
+  margin-top: 14px; border-radius: var(--radius); padding: 14px 16px; display: flex; align-items: center; gap: 16px;
+  background: var(--ok-soft); border: 1px solid var(--ok);
+}
+.cm .resultado.error{ background: var(--err-soft); border-color: var(--err); }
+.cm .resultado .grande{ font-size: 30px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+.cm .resultado .grande small{ font-size: 14px; font-weight: 600; }
+.cm .resultado .det{ font-size: 12.5px; color: var(--muted); }
+.cm .resultado .det b{ color: var(--text); }
+.cm .chips{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.cm .chip{ display: inline-flex; align-items: center; gap: 4px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 3px 4px 3px 10px; font-size: 12.5px; }
+.cm .chip button{ border: none; background: none; color: var(--muted); padding: 0 4px; border-radius: 50%; }
+.cm .chip button:hover{ color: var(--err); }
+.cm .ayuda{ background: var(--primary-soft); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius); padding: 10px 14px; font-size: 12.5px; margin-bottom: 16px; }
+.cm .alerta-admin{ background: var(--warn-soft); border: 1px solid var(--warn); color: var(--text); border-radius: var(--radius); padding: 10px 14px; font-size: 12.5px; margin-bottom: 16px; }
+.cm .subtabs{ display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
+.cm .subtab{ border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 999px; padding: 5px 14px; font-size: 13px; }
+.cm .subtab.activa{ background: var(--app); color: var(--app-tinta, #fff); border-color: var(--app); }
+/* ---------- Diálogo / toast ---------- */
+.cm dialog{ border: none; border-radius: 16px; padding: 0; color: var(--text); width: min(480px, calc(100vw - 32px)); }
+.cm dialog::backdrop{ background: rgba(20, 24, 32, .28); }
+.cm dialog form{ padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+.cm dialog h3{ font-size: 17px; color: var(--app); }
+.cm #dlgCuerpo{ display: flex; flex-direction: column; gap: 10px; font-size: 13.5px; color: var(--muted); }
+.cm .dlg-acciones{ display: flex; flex-direction: row-reverse; justify-content: flex-start; gap: 8px; }
+/* Aceptar va primero en el DOM: Enter = Aceptar */
+.cm dialog{ background: var(--surface); box-shadow: 0 20px 60px rgba(0,0,0,.3); }
+.cm .toast{
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(20px);
+  padding: 10px 18px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .35s var(--inercia, ease); z-index: 100;
+}
+.cm .toast.on{ opacity: 1; transform: translateX(-50%) translateY(0); }
+/* ---------- Acceso (modo Supabase) ---------- */
+/* ======================================================================================
+   Entregable impreso — formato Sinergia (SkillFormato)
+   Hoja carta, márgenes 3,0 / 2,5 cm, membrete y pie en las cajas de margen del @page.
+   Cuerpo en Montserrat 11 pt, interlínea 1,08, justificado, monocromo (solo la criticidad lleva color).
+   Tablas: reglas horizontales, sin verticales ni relleno; títulos «Tabla No. N»; sin celdas en blanco.
+   ====================================================================================== */
+/* logo horizontal 5,7 cm; invade el margen izquierdo a propósito (formato Sinergia) */
+.cm .crit-err{ color: var(--doc-err, var(--err)); font-weight: 600; }
+.cm .crit-warn{ color: var(--doc-warn, var(--warn)); font-weight: 600; }
+/* ---------- Impresión ---------- */
+
+/* La herramienta conserva su maquetación interna, pero hereda color y tipografía de la Suite.
+   Colores: solo los de la Suite (color de la app y estados de eva-ui.css). */
+.cm{
+  --bg:transparent; --surface:#fff; --surface-2:var(--hie);
+  --border:var(--brd); --border-strong:color-mix(in srgb, var(--brd) 60%, #555);
+  --text:var(--neg); --muted:color-mix(in srgb, var(--graf) 72%, #fff);
+  --ink:var(--neg); --ink-2:var(--graf); --ink-3:var(--ace);
+  --primary:var(--app); --primary-ink:#fff; --primary-soft:color-mix(in srgb, var(--app) 10%, #fff);
+  --ok:var(--vm); --ok-soft:var(--vm-lite); --warn-soft:var(--warn-bg);
+  --err:var(--danger); --err-soft:var(--danger-bg); --err-bg:var(--danger-bg);
+  --input-bg:color-mix(in srgb, var(--app) 5%, #fff); --input-line:color-mix(in srgb, var(--app) 28%, var(--brd));
+  --calc-bg:var(--hie); --radius:8px;
+  font:14px/1.45 var(--font); color:var(--text);
+}
+/* eva-ui.css reinicia márgenes, pone etiquetas en mayúsculas y da ancho completo a los campos */
+.cm p{margin:0 0 .6em}
+.cm ul,.cm ol{margin:0 0 .6em;padding-left:1.3em}
+.cm label{font-size:inherit;font-weight:inherit;text-transform:none;letter-spacing:normal;color:inherit;margin-bottom:0}
+.cm h1,.cm h2,.cm h3,.cm h4{text-transform:none}
+.cm table{border-collapse:collapse}
+.cm input[type=checkbox]{width:16px}
+.cm .pagina{padding:0}
+/* Botones: la base es la de la Suite (primario); el resto de variantes se mapea acá.
+   suite-color.css pinta .btn con la especificidad de tres :not(); se iguala para poder devolver el estilo neutro. */
+.cm .btn:not(.primary):not(.btn--ghost):not(.btn--danger):not(.btn--warn){background:#fff;color:var(--neg);border:1px solid var(--brd)}
+.cm .btn:not(.primary):not(.btn--ghost):not(.btn--danger):not(.btn--warn):hover{background:var(--hie)}
+.cm .btn.ghost:not(.primary):not(.btn--ghost):not(.btn--danger):not(.btn--warn){background:transparent}
+.cm .btn.danger:not(.primary):not(.btn--ghost):not(.btn--danger):not(.btn--warn){color:var(--err);border-color:color-mix(in srgb, var(--err) 35%, #fff)}
+.cm .btn-sm{padding:6px 11px;font-size:10px}
+.cm .btn-icon{background:none!important;border:none!important;color:var(--ace);padding:2px 6px;box-shadow:none}
+.cm .btn-icon:hover{background:var(--hie)!important;color:var(--neg)}
+.cm .btn-icon.del:hover{color:var(--err)}
+.cm .btn{white-space:nowrap}
+.cm .btn:disabled{opacity:.5;cursor:not-allowed}
+
+
+/* Modelo con búsqueda (lista flotante, fuera de .cm: se monta en el body) */
+.combo-lista{position:fixed;z-index:2000;display:none;overflow-y:auto;background:var(--wh,#fff);color:var(--neg);border:1px solid var(--brd);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.18);padding:4px;font-family:var(--font)}
+.combo-it{display:block;width:100%;text-align:left;border:0;background:transparent;color:inherit;font:inherit;font-size:12px;padding:6px 8px;border-radius:6px;cursor:pointer}
+.combo-it:hover,.combo-it.activo{background:var(--hie)}
+.combo-vacio{color:var(--ace)}
+.combo-fab{display:inline-block;min-width:4.8rem;font-size:11px;font-weight:700;color:var(--app)}
+.combo-ma{float:right;margin-left:10px;color:var(--ace);font-variant-numeric:tabular-nums}
+.combo-mas{padding:6px 8px;font-size:12px;color:var(--ace)}
